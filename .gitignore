@@ -13,7 +13,7 @@
 **/MDK-ARM/*.bak
 **/MDK-ARM/*.dep
 **/MDK-ARM/JLink*
-**/MDK-ARM/OTA/
+**/MDK-ARM/Objects/
 **/MDK-ARM/RTE/
 
 # CMake / CLion / VSCode 临时缓存
@@ -26,3 +26,9 @@ cmake-build-*/
 *.tmp
 .DS_Store
 Thumbs.db
+debug-artifacts/
+rollback-backups/
+.codex-remote-attachments/
+__pycache__/
+/app.bin
+*.uvguix.*
