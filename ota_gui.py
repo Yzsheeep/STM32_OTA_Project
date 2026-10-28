@@ -20,7 +20,7 @@ STM32 蓝牙 OTA 固件升级上位机（单文件脚本 ota_gui.py）
        固件信息通过 'H' / 'h' 握手发送，保存成功收到 'H' 后继续
        阶段二 'E' 外部 Flash 多扇区擦除握手
        阶段三 128 字节停等流控分包传输（ACK == b'0'）
-       阶段四发送 'C' 请求搬运，固定等待后显示成功，未确认安装结果或 APP 启动
+       阶段四发送 'C' 请求搬运，等待 APP 启动提示，再发送 'V' 查询实际版本
 
 线程模型:
     云端请求和 OTA 串口收发在后台线程执行，端口扫描和打开/关闭仍在主线程。
@@ -56,9 +56,9 @@ BAUD_LIST = ["4800", "9600", "19200", "38400", "57600", "115200", "230400"]
 
 DEFAULT_API_URL = "https://example.com/api/ota/latest"
 DEFAULT_DOWNLOAD_URL = "https://example.com/app.bin"
-DEFAULT_DEVICE_VERSION = "V1.0.0"
+UNKNOWN_DEVICE_VERSION = "未查询"
 
-# Mock 模式演示元数据；更新日志及大小不代表本地固件实际功能，设备版本也未通过串口查询
+# Mock 模式演示元数据；更新日志及大小不代表本地固件实际功能
 MOCK_LATEST_VERSION = "1.0.1"
 MOCK_SIZE = 9492
 MOCK_CHANGELOG = (
@@ -74,6 +74,9 @@ FONT_FAMILY = "Microsoft YaHei UI"
 UI_QUEUE_POLL_MS = 50            # UI 任务队列轮询间隔
 CLOUD_TIMEOUT_S = 15             # 云端 HTTP 超时
 DOWNLOAD_TIMEOUT_S = 60          # 固件下载 HTTP 超时
+APP_BOOT_TIMEOUT_S = 20          # 搬运、校验及 APP 启动的等待上限
+VERSION_TIMEOUT_S = 3            # APP 主循环可能延迟约 1 秒才响应 V
+APP_START_MESSAGE = b"Hello! I am App in 2nd Floor!\r\n"
 
 
 # ================================================================
@@ -138,6 +141,7 @@ class OTAGuiApp:
         self.cloud_info: Optional[dict] = None       # 云端 JSON 信息
         self.ota_running = False
         self.checking_cloud = False
+        self.device_version: Optional[str] = None   # 仅保存设备实际回复的版本
 
         self._build_styles()
         self._build_ui()
@@ -257,7 +261,7 @@ class OTAGuiApp:
         ttk.Label(info_grid, text="设备当前版本:", style="InfoKey.TLabel").grid(
             row=0, column=0, sticky="w", padx=(0, 4), pady=2
         )
-        self.device_ver_var = tk.StringVar(value=DEFAULT_DEVICE_VERSION)
+        self.device_ver_var = tk.StringVar(value=UNKNOWN_DEVICE_VERSION)
         ttk.Label(info_grid, textvariable=self.device_ver_var, style="InfoVal.TLabel").grid(
             row=0, column=1, sticky="w", pady=2
         )
@@ -394,6 +398,7 @@ class OTAGuiApp:
         self.lbl_hint.configure(fg=color)
 
     def _set_device_version(self, ver: str) -> None:
+        self.device_version = None if ver == UNKNOWN_DEVICE_VERSION else ver
         self.device_ver_var.set(ver)
 
     def _set_cloud_fields(self, version: str, size_text: str, changelog: str) -> None:
@@ -488,6 +493,7 @@ class OTAGuiApp:
         self.conn_status_var.set("● 已连接")
         self.lbl_conn_status.configure(foreground="#27ae60")
         self.log(f"串口已打开: {port} @ {baud} bps", "OK")
+        self._set_device_version(UNKNOWN_DEVICE_VERSION)
 
     def _close_serial(self) -> None:
         if self.ota_running:
@@ -498,6 +504,7 @@ class OTAGuiApp:
         self.conn_status_var.set("● 未连接")
         self.lbl_conn_status.configure(foreground="#c0392b")
         self.log("串口已关闭")
+        self._set_device_version(UNKNOWN_DEVICE_VERSION)
 
     def _close_serial_quiet(self) -> None:
         try:
@@ -549,8 +556,11 @@ class OTAGuiApp:
             f"云端信息 -> 最新版本: {latest} | 大小: {size_text} | 更新日志:\n{changelog}"
         )
 
-        local_ver = self.device_ver_var.get()
-        if is_newer_version(latest, local_ver):
+        local_ver = self.device_version
+        if local_ver is None:
+            self.log("设备版本尚未查询，云端信息不代表设备当前版本。", "WARN")
+            self.ui_call(self._set_hint, "云端固件已就绪，设备版本未查询", "#7f8c8d")
+        elif is_newer_version(latest, local_ver):
             self.log(f"发现新版本: {local_ver} -> {latest}，固件已缓存至内存", "OK")
             self.ui_call(self._set_hint, "发现新版本，固件已就绪", "#27ae60")
         else:
@@ -626,13 +636,13 @@ class OTAGuiApp:
 
         self.log(f"云端 JSON 解析成功: {info}")
 
-        local_ver = self.device_ver_var.get()
+        local_ver = self.device_version
         data: Optional[bytes] = None
-        if is_newer_version(str(info.get("latest_version", "")), local_ver):
+        if local_ver is None or is_newer_version(str(info.get("latest_version", "")), local_ver):
             dl_url = str(info.get("download_url", "")).strip()
             if not dl_url:
                 raise RuntimeError("download_url 为空，无法下载固件")
-            self.log(f"检测到新版本，开始下载固件: {dl_url}")
+            self.log(f"开始下载云端固件: {dl_url}")
             try:
                 r = requests.get(dl_url, timeout=DOWNLOAD_TIMEOUT_S)
                 r.raise_for_status()
@@ -688,6 +698,7 @@ class OTAGuiApp:
             return
 
         self.ota_running = True
+        self._set_device_version(UNKNOWN_DEVICE_VERSION)
         self.btn_start.configure(state=tk.DISABLED, text="OTA 升级进行中 ...")
         self._set_controls_enabled(False)
         self._set_progress(0.0, "进度: 0.0% | 准备升级 ...")
@@ -714,7 +725,7 @@ class OTAGuiApp:
             widget.configure(state=state)
 
     def _ota_worker(self, data: bytes) -> None:
-        """先发送固件信息，再传输固件；安装与启动结果仍需实物确认。"""
+        """发送固件后，等待 APP 启动并查询设备实际版本。"""
         success = False
         try:
             self.log("=" * 60)
@@ -855,40 +866,108 @@ class OTAGuiApp:
 
         self.log(f"阶段三完成: 全部 {total_pkts} 个分包均收到 ACK '0'", "OK")
 
-    # ---- 阶段四：请求内部 Flash 搬运（指令 'C'）；当前不接收搬运或启动确认 ----
+    # ---- 阶段四：请求搬运，确认 APP 启动后查询版本 ----
     def _phase_copy_and_boot(self, data: bytes) -> None:
         self.log("阶段四: 所有分包传输完毕，准备片内 Flash 搬迁 ...")
         time.sleep(0.5)
 
         try:
+            self.ser.reset_input_buffer()  # 后续只接受本次 C 指令之后的启动输出
             self.ser.write(b"C")
             self.ser.flush()
         except (serial.SerialException, OSError) as e:
             raise RuntimeError(f"串口写入搬迁指令失败（可能已断开）: {e}") from e
 
-        self.log("阶段四: 已发送搬迁指令 'C'，等待片内 Flash 擦写与软复位（约 3 秒） ...")
-        time.sleep(3.0)  # 固定等待 3 秒，未确认内部 Flash 擦写完成或新 APP 已运行
+        self.log("阶段四: 已发送 C，等待固件校验、片内 Flash 擦写及 APP 启动 ...")
+        self.ui_call(self._set_progress, 100.0, "固件已发送，正在等待安装及 APP 启动确认 ...")
+        self._wait_for_app_start()
+        new_ver = self._query_app_version()
+        self.ui_call(self._set_device_version, new_ver)
+        self.log(f"设备实际返回的当前版本: {new_ver}", "OK")
 
         total = len(data)
         self.ui_call(
             self._set_progress,
             100.0,
-            f"进度: 100.0% | 包 #{(total + CHUNK_SIZE - 1) // CHUNK_SIZE}/{(total + CHUNK_SIZE - 1) // CHUNK_SIZE} ({total}/{total} 字节)",
+            f"进度: 100.0% | 已确认 APP 启动，设备版本 {new_ver} ({total}/{total} 字节)",
         )
 
-        # 仅按云端信息或默认值更新界面版本；未查询设备实际版本，本地文件模式下也未解析固件版本
-        new_ver = DEFAULT_DEVICE_VERSION
-        if self.cloud_info and self.cloud_info.get("latest_version"):
-            new_ver = str(self.cloud_info["latest_version"])
-        self.ui_call(self._set_device_version, new_ver)
-        self.log(f"设备当前版本已更新为: {new_ver}")
-
-        # 以下提示仅表示发送流程结束，设备启动仍需确认。
-        self.log("固件发送及搬运请求已完成，请确认开发板是否进入 App。", "OK")
+        self.log("已确认设备进入 APP 并回复版本。", "OK")
         self.ui_call(
             messagebox.showinfo,
-            "发送流程完成",
-            "固件发送及搬运请求已完成，请确认开发板是否进入 App。",
+            "APP 启动已确认",
+            f"设备已进入 APP，并回复当前版本：{new_ver}",
+        )
+
+    def _wait_for_app_start(self) -> None:
+        """只读取启动输出；未确认 APP 前不能向 Bootloader 发送 V。"""
+        received = bytearray()
+        previous_timeout = self.ser.timeout
+        errors = (b"CRC check failed", b"APP CRC failed", b"Erase Failed!", b"Meta Read Err!")
+        try:
+            self.ser.timeout = 0.1
+            deadline = time.monotonic() + APP_BOOT_TIMEOUT_S
+            while time.monotonic() < deadline:
+                received.extend(self.ser.read(self.ser.in_waiting or 1))
+                if any(message in received for message in errors):
+                    output = received.decode("utf-8", errors="replace").replace("\x00", "").strip()
+                    raise RuntimeError(f"设备安装未完成，返回：{output}")
+                if APP_START_MESSAGE in received:
+                    for line in received.decode("utf-8", errors="replace").replace("\x00", "").splitlines():
+                        if line.strip():
+                            self.log(f"< {line}")
+                    self.log("已收到 APP 启动提示，准备查询设备版本。", "OK")
+                    return
+                # 保留足够的尾部以识别被串口拆开的消息，避免异常输出无限累积。
+                if len(received) > 8192:
+                    del received[:-4096]
+        except (serial.SerialException, OSError) as e:
+            raise RuntimeError(f"等待 APP 启动时串口通信失败: {e}") from e
+        finally:
+            self.ser.timeout = previous_timeout
+
+        output = received.decode("utf-8", errors="replace").replace("\x00", "").strip() or "没有收到输出"
+        raise RuntimeError(
+            f"{APP_BOOT_TIMEOUT_S} 秒内未确认 APP 启动，不发送 V；设备输出：{output}"
+        )
+
+    def _query_app_version(self) -> str:
+        """仅在本轮已确认 APP 启动后，发送一个 V 并等待完整版本回复。"""
+        received = bytearray()
+        previous_timeout = self.ser.timeout
+        try:
+            self.ser.timeout = 0.1
+            self.ser.reset_input_buffer()
+            self.ser.write(b"V")
+            self.ser.flush()
+            self.log("发送 V，查询 APP 实际版本 ...")
+            deadline = time.monotonic() + VERSION_TIMEOUT_S
+            while time.monotonic() < deadline:
+                received.extend(self.ser.read(self.ser.in_waiting or 1))
+                while b"\n" in received:
+                    line, _, remainder = received.partition(b"\n")
+                    received = bytearray(remainder)
+                    text = line.decode("ascii", errors="replace").strip("\r\x00 ")
+                    if not text:
+                        continue
+                    self.log(f"< {text}")
+                    if text.startswith("APP_VERSION="):
+                        version = text[len("APP_VERSION="):].strip()
+                        parts = version.split(".")
+                        if len(version) > 32 or len(parts) != 3 or not all(
+                            part.isascii() and part.isdigit() for part in parts
+                        ):
+                            raise RuntimeError(f"APP 版本回复格式无效：{text}")
+                        return f"V{version}"
+                if len(received) > 1024:
+                    raise RuntimeError("APP 版本回复过长，无法确认设备版本。")
+        except (serial.SerialException, OSError) as e:
+            raise RuntimeError(f"查询 APP 版本时串口通信失败: {e}") from e
+        finally:
+            self.ser.timeout = previous_timeout
+
+        raise RuntimeError(
+            f"APP 已启动，但 {VERSION_TIMEOUT_S} 秒内未收到完整的 APP_VERSION 回复，版本未确认。"
         )
 
     # ------------------------------------------------------------ 退出

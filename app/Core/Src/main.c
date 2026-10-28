@@ -50,6 +50,8 @@
 /* USER CODE BEGIN PV */
 uint8_t app_rx_buf[10] = {0}; // App 串口接收缓冲区
 volatile uint8_t need_reboot_to_ota = 0; // 升级请求：回调置 1，主循环处理
+volatile uint8_t need_report_version = 0;
+uint8_t app_version_msg[] = "APP_VERSION=1.0.2\r\n";
 /* USER CODE END PV */
 
 /* Private function prototypes -----------------------------------------------*/
@@ -112,8 +114,14 @@ int main(void)
       need_reboot_to_ota = 0;
       App_TriggerOTA_Reboot();
     }
+    if (need_report_version)
+    {
+        need_report_version = 0; // 清除请求，避免每轮重复发送
+
+        HAL_UART_Transmit(&huart1,app_version_msg,sizeof(app_version_msg) - 1U,1000);
+    }
 	  HAL_GPIO_TogglePin(GPIOC,GPIO_PIN_13);
-	  HAL_Delay(200);
+	  HAL_Delay(1000);
    
     
     /* USER CODE END WHILE */
@@ -215,6 +223,10 @@ void HAL_UARTEx_RxEventCallback(UART_HandleTypeDef *huart,uint16_t Size)
         if (Size == 1 && app_rx_buf[0] == 'U')
         {
             need_reboot_to_ota = 1;
+        }
+        else if (Size == 1 && app_rx_buf[0] == 'V')
+        {
+            need_report_version = 1;
         }
 
         HAL_UARTEx_ReceiveToIdle_IT(&huart1, app_rx_buf, sizeof(app_rx_buf));
