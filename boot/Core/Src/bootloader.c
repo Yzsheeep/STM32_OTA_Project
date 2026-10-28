@@ -40,7 +40,7 @@ void Bootloader_JumpToApp(uint32_t app_addr)
     }
 }
 
-void Bootloader_EraseApp(void)
+HAL_StatusTypeDef Bootloader_EraseApp(void)
 {
     FLASH_EraseInitTypeDef EraseInitStruct; // Flash 擦除参数
     uint32_t PageError = 0; // HAL 输出的擦除失败页地址
@@ -56,7 +56,9 @@ void Bootloader_EraseApp(void)
     EraseInitStruct.NbPages     = APP_FLASH_PAGES;       // 48 页，每页 1 KB
 
     // 3. 打印擦除结果，未返回状态
-    if (HAL_FLASHEx_Erase(&EraseInitStruct, &PageError) == HAL_OK)
+    HAL_StatusTypeDef result = HAL_FLASHEx_Erase(&EraseInitStruct, &PageError);
+
+    if (result == HAL_OK)
     {
         HAL_UART_Transmit(&huart1, (uint8_t *)"Erase Success!\r\n", 16, 1000);
     }
@@ -67,6 +69,7 @@ void Bootloader_EraseApp(void)
 
     // 4. 重新锁上 Flash
     HAL_FLASH_Lock();
+    return result;
 }
 
 // flash_addr：写入地址；p_data：数据；len：字节数

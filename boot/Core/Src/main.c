@@ -62,6 +62,7 @@ uint32_t current_write_addr = 0x000000; // W25Q64 下次写入地址
 volatile uint8_t cmd_flag = 0; // 待执行任务，由串口回调设置
 volatile uint16_t rx_len = 0; // 本次接收长度（字节）
 
+
 /* USER CODE END PV */
 
 /* Private function prototypes -----------------------------------------------*/
@@ -249,7 +250,11 @@ int main(void)
                     break; // 退出当前case，不执行下面的擦除
                 }
 
-                Bootloader_EraseApp(); // 擦除 App 分区，尚未处理失败
+                if (Bootloader_EraseApp() != HAL_OK)
+                {
+                    cmd_flag = 0;
+                    break; // 擦除失败，退出当前 case，不继续搬运
+                }
 
                 
                 uint32_t src_addr = 0x000000; // W25Q64 读取地址
@@ -266,7 +271,33 @@ int main(void)
                     dst_addr += chunk;
                     copied   += chunk;
                 }
-                // 搬运后清标志，尚未校验完整固件
+                crc = 0xFFFFFFFFU; // 开始新的 CRC 计算，重新设置初始值
+                const uint8_t *app_data = (const uint8_t *)APP_FLASH_ADDR; // 按字节读取内部 APP
+                for (uint32_t i = 0; i < total_size; i++)
+                {
+                    crc ^= app_data[i]; // 读取内部 APP 的一个字节，合入 CRC
+
+                    for (uint8_t bit = 0; bit < 8; bit++)
+                    {
+                        if ((crc & 1U) != 0)
+                        {
+                            crc = (crc >> 1) ^ 0xEDB88320U;
+                        }
+                        else
+                        {
+                            crc >>= 1;
+                        }
+                    }
+                }
+
+                crc ^= 0xFFFFFFFFU; // 全部字节处理完，最终取反
+                if (crc != meta.firmware_crc32)
+                {
+                    HAL_UART_Transmit(&huart1, (uint8_t *)"APP CRC failed\r\n", 16, 1000);
+                    cmd_flag = 0;
+                    break; // 退出当前 case，不清升级标志，也不执行后面的复位
+                }
+                // 搬运后清标志
                 meta.ota_flag = OTA_FLAG_NORMAL;
                 Bootloader_WriteMeta(&meta);
 
