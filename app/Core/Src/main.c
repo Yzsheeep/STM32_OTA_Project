@@ -51,7 +51,7 @@
 uint8_t app_rx_buf[10] = {0}; // App 串口接收缓冲区
 volatile uint8_t need_reboot_to_ota = 0; // 升级请求：回调置 1，主循环处理
 volatile uint8_t need_report_version = 0;
-uint8_t app_version_msg[] = "APP_VERSION=1.0.2\r\n";
+uint8_t app_version_msg[] = "APP_VERSION=1.0.1\r\n";
 /* USER CODE END PV */
 
 /* Private function prototypes -----------------------------------------------*/
