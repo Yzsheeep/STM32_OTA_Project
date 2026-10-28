@@ -73,8 +73,9 @@ HAL_StatusTypeDef Bootloader_EraseApp(void)
 }
 
 // flash_addr：写入地址；p_data：数据；len：字节数
-void Bootloader_WriteFlash(uint32_t flash_addr, uint8_t *p_data, uint32_t len)
+HAL_StatusTypeDef Bootloader_WriteFlash(uint32_t flash_addr, uint8_t *p_data, uint32_t len)
 {
+    HAL_StatusTypeDef result = HAL_OK;
     // 1. 解锁 Flash
     HAL_FLASH_Unlock();
 
@@ -85,12 +86,18 @@ void Bootloader_WriteFlash(uint32_t flash_addr, uint8_t *p_data, uint32_t len)
         // 取出 4 字节，需保证对齐和可读范围
         uint32_t word_data = *(uint32_t *)(p_data + i); // 本轮写入的 4 字节数据
 
-        // 写入内部 Flash，尚未检查结果
-        HAL_FLASH_Program(FLASH_TYPEPROGRAM_WORD, flash_addr + i, word_data);
+        // 写入内部 Flash
+        result = HAL_FLASH_Program(FLASH_TYPEPROGRAM_WORD,flash_addr + i,word_data);
+
+        if (result != HAL_OK)
+        {
+            break; // 本次写入失败，停止后续写入
+        }
     }
 
     // 3. 重新上锁
     HAL_FLASH_Lock();
+    return result;
 }
 
 

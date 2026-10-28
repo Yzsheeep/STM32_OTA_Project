@@ -26,7 +26,7 @@ void Bootloader_JumpToApp(uint32_t app_addr);
 HAL_StatusTypeDef Bootloader_EraseApp(void);
 
 // 写入内部 Flash，长度需为 4 的倍数
-void Bootloader_WriteFlash(uint32_t flash_addr, uint8_t *p_data, uint32_t len);
+HAL_StatusTypeDef Bootloader_WriteFlash(uint32_t flash_addr, uint8_t *p_data, uint32_t len);
 
 
 // EEPROM 固件信息读写接口

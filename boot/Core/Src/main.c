@@ -261,15 +261,25 @@ int main(void)
                 uint32_t dst_addr = APP_FLASH_ADDR; // 内部 Flash 写入地址
                  // 固件总长度（字节）
                 uint32_t copied = 0; // 累计搬运字节数，未校验结果
+                HAL_StatusTypeDef write_result = HAL_OK;
 
                 while (copied < total_size)
                 {
                     uint16_t chunk = (total_size - copied > 256) ? 256 : (total_size - copied); // 本轮搬运字节数，最多 256
                     W25Q64_Read_Data(src_addr, move_buf, chunk);
-                    Bootloader_WriteFlash(dst_addr, move_buf, chunk);
+                    write_result = Bootloader_WriteFlash(dst_addr, move_buf, chunk);
+                    if (write_result != HAL_OK)
+                    {
+                        break; // 退出 while，停止搬运
+                    }
                     src_addr += chunk;
                     dst_addr += chunk;
                     copied   += chunk;
+                }
+                if (write_result != HAL_OK)
+                {
+                    cmd_flag = 0;
+                    break; // 退出当前 case，跳过后续处理
                 }
                 crc = 0xFFFFFFFFU; // 开始新的 CRC 计算，重新设置初始值
                 const uint8_t *app_data = (const uint8_t *)APP_FLASH_ADDR; // 按字节读取内部 APP
