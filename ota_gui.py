@@ -12,7 +12,7 @@ STM32 蓝牙 OTA 固件升级上位机（单文件脚本 ota_gui.py）
     - pyserial             (蓝牙串口通信)
 
 功能:
-    1. 串口连接配置（自动扫描端口 / 波特率 / 打开关闭 + 状态指示）
+    1. 串口连接配置，打开后发送 'V' 查询实际版本（Bootloader 需支持忽略 'V'）
     2. 云端固件更新检测（真实 API 或内置 Mock 模拟云端）
     3. 固件来源切换（云端下载 / 本地 .bin）
     4. 发送升级请求、16 字节固件信息和固件数据：
@@ -24,7 +24,7 @@ STM32 蓝牙 OTA 固件升级上位机（单文件脚本 ota_gui.py）
 
 线程模型:
     云端请求和 OTA 串口收发在后台线程执行，端口扫描和打开/关闭仍在主线程。
-    UI 更新主要通过 queue.Queue + root.after() 调度；后台仍读取部分 Tk 变量，不能保证全部 Tk 访问线程安全。
+    后台使用主线程启动时传入的参数；UI 更新通过 queue.Queue + root.after() 调度。
 """
 
 from __future__ import annotations
@@ -32,6 +32,7 @@ from __future__ import annotations
 import datetime
 import os
 import queue
+import re
 import struct
 import threading
 import time
@@ -51,20 +52,18 @@ from tkinter import filedialog, messagebox, scrolledtext, ttk
 # 常量配置
 # ================================================================
 CHUNK_SIZE = 128                 # 上位机每包最多 128 字节并等待应答；不保证设备端接收事件边界一致
+MAX_FIRMWARE_SIZE = 16 * 1024     # 与 Bootloader 当前固定擦除的暂存范围一致
 DEFAULT_BAUD = 9600              # 默认波特率
 BAUD_LIST = ["4800", "9600", "19200", "38400", "57600", "115200", "230400"]
 
-DEFAULT_API_URL = "https://example.com/api/ota/latest"
-DEFAULT_DOWNLOAD_URL = "https://example.com/app.bin"
+DEFAULT_API_URL = "https://raw.githubusercontent.com/Yzsheeep/STM32_OTA_Project/main/firmware/latest.json"
+DEFAULT_DOWNLOAD_URL = "https://github.com/Yzsheeep/STM32_OTA_Project/releases/download/v1.0.1/app.bin"
 UNKNOWN_DEVICE_VERSION = "未查询"
 
 # Mock 模式演示元数据；更新日志及大小不代表本地固件实际功能
 MOCK_LATEST_VERSION = "1.0.1"
-MOCK_SIZE = 9492
-MOCK_CHANGELOG = (
-    "1. 优化 PC13 状态灯为 100ms 极速快闪\n"
-    "2. 完善多扇区擦除与防变砖机制"
-)
+MOCK_SIZE = 0
+MOCK_CHANGELOG = "本地文件模拟云端返回，仅用于界面演示。"
 
 FIRMWARE_FILENAME = "app.bin"
 
@@ -109,6 +108,32 @@ def is_newer_version(remote: str, local: str) -> bool:
     return parse_version(remote) > parse_version(local)
 
 
+def firmware_version_code(ver: str) -> int:
+    """将主版本.次版本.修订号编码为现有元数据中的 uint32_t。"""
+    parts = ver.strip().lstrip("Vv").split(".")
+    if len(parts) != 3 or not all(part.isascii() and part.isdigit() for part in parts):
+        raise ValueError(f"版本格式应为 1.0.1：{ver}")
+    major, minor, patch = (int(part) for part in parts)
+    if any(part > 255 for part in (major, minor, patch)):
+        raise ValueError("版本号每一段必须在 0～255 之间。")
+    return (major << 16) | (minor << 8) | patch
+
+
+def firmware_version_from_bin(data: bytes) -> str:
+    """读取当前 APP 已有的版本回复字符串，不增加新的固件头。"""
+    versions = set(re.findall(rb"APP_VERSION=([0-9]+\.[0-9]+\.[0-9]+)\r\n\x00", data))
+    if len(versions) != 1:
+        raise ValueError("固件中未找到唯一的 APP_VERSION 版本标识，请使用当前 APP 工程生成的 .bin。")
+    version = versions.pop().decode("ascii")
+    firmware_version_code(version)
+    return version
+
+
+def validate_firmware_size(size: int) -> None:
+    if not 8 <= size <= MAX_FIRMWARE_SIZE or size % 4:
+        raise ValueError("当前固件长度必须为 8 字节到 16 KB，且为 4 字节的整数倍。")
+
+
 def format_size(num_bytes: int) -> str:
     """格式化固件大小显示。"""
     return f"{num_bytes} 字节 ({num_bytes / 1024:.2f} KB)"
@@ -141,6 +166,7 @@ class OTAGuiApp:
         self.cloud_info: Optional[dict] = None       # 云端 JSON 信息
         self.ota_running = False
         self.checking_cloud = False
+        self.querying_version = False
         self.device_version: Optional[str] = None   # 仅保存设备实际回复的版本
 
         self._build_styles()
@@ -230,7 +256,7 @@ class OTAGuiApp:
         self.api_entry = ttk.Entry(api_row, textvariable=self.api_url_var)
         self.api_entry.pack(side=tk.LEFT, fill=tk.X, expand=True, padx=(6, 10))
 
-        self.mock_var = tk.BooleanVar(value=True)   # 默认勾选 Mock 模式
+        self.mock_var = tk.BooleanVar(value=False)  # 默认访问真实更新源
         self.mock_chk = ttk.Checkbutton(
             api_row, text="内置模拟云端 (Mock 模式)", variable=self.mock_var
         )
@@ -459,6 +485,8 @@ class OTAGuiApp:
                 self.log(f"读取文件信息失败: {e}", "ERROR")
 
     def _toggle_serial(self) -> None:
+        if self.querying_version:
+            return
         if self.ser is not None and self.ser.is_open:
             self._close_serial()
         else:
@@ -494,6 +522,33 @@ class OTAGuiApp:
         self.lbl_conn_status.configure(foreground="#27ae60")
         self.log(f"串口已打开: {port} @ {baud} bps", "OK")
         self._set_device_version(UNKNOWN_DEVICE_VERSION)
+        self.querying_version = True
+        self._set_controls_enabled(False)
+        self.btn_start.configure(state=tk.DISABLED)
+        self._set_hint("正在查询设备实际版本 ...", "#2980b9")
+        threading.Thread(target=self._query_connected_version, daemon=True).start()
+
+    def _query_connected_version(self) -> None:
+        """连接后只发送 V；Bootloader 必须已加入忽略 V 的分支。"""
+        version = None
+        try:
+            version = self._query_app_version()
+            self.log(f"连接查询成功，设备当前版本：{version}", "OK")
+        except Exception as e:  # noqa: BLE001
+            self.log(f"设备版本查询失败：{e}", "WARN")
+
+        def _done() -> None:
+            self.querying_version = False
+            self._set_device_version(version or UNKNOWN_DEVICE_VERSION)
+            if version is not None:
+                self._set_hint("设备版本已查询，请点击检查云端更新", "#27ae60")
+            else:
+                self.device_ver_var.set("查询失败")
+                self._set_hint("版本查询失败，请确认 APP 正在运行及串口连接正常", "#c0392b")
+            self._set_controls_enabled(True)
+            self.btn_start.configure(state=tk.NORMAL)
+
+        self.ui_call(_done)
 
     def _close_serial(self) -> None:
         if self.ota_running:
@@ -523,20 +578,31 @@ class OTAGuiApp:
 
     # ------------------------------------------------------------ 云端检测与固件拉取
     def _check_cloud(self) -> None:
-        if self.checking_cloud or self.ota_running:
+        if self.checking_cloud or self.ota_running or self.querying_version:
             return
         self.checking_cloud = True
-        self.btn_check.configure(state=tk.DISABLED)
+        self.cloud_info = None
+        self.firmware_data = None
+        self._set_cloud_fields("—", "—", "")
+        self._set_controls_enabled(False)
+        self.btn_start.configure(state=tk.DISABLED)
         self._set_hint("正在检查云端更新 ...", "#2980b9")
         self.log("开始检查云端固件更新 ...")
-        threading.Thread(target=self._check_cloud_worker, daemon=True).start()
+        # 在主线程读取 Tk 变量，后台只接收普通 Python 参数。
+        args = (
+            self.mock_var.get(), self.api_url_var.get().strip(),
+            self.local_path_var.get().strip(), self.device_version,
+        )
+        threading.Thread(target=self._check_cloud_worker, args=args, daemon=True).start()
 
-    def _check_cloud_worker(self) -> None:
+    def _check_cloud_worker(
+        self, use_mock: bool, url: str, local_path: str, local_ver: Optional[str]
+    ) -> None:
         try:
-            if self.mock_var.get():
-                info, data = self._fetch_mock_cloud()
+            if use_mock:
+                info, data = self._fetch_mock_cloud(local_path)
             else:
-                info, data = self._fetch_real_cloud()
+                info, data = self._fetch_real_cloud(url, local_ver)
         except Exception as e:  # noqa: BLE001
             msg = f"云端检查失败: {e}"
             self.log(msg, "ERROR")
@@ -556,9 +622,8 @@ class OTAGuiApp:
             f"云端信息 -> 最新版本: {latest} | 大小: {size_text} | 更新日志:\n{changelog}"
         )
 
-        local_ver = self.device_version
         if local_ver is None:
-            self.log("设备版本尚未查询，云端信息不代表设备当前版本。", "WARN")
+            self.log("云端固件已下载并核验；设备版本未查询，本次不判断是否有新版本。", "WARN")
             self.ui_call(self._set_hint, "云端固件已就绪，设备版本未查询", "#7f8c8d")
         elif is_newer_version(latest, local_ver):
             self.log(f"发现新版本: {local_ver} -> {latest}，固件已缓存至内存", "OK")
@@ -572,11 +637,13 @@ class OTAGuiApp:
     def _finish_cloud_check(self) -> None:
         def _done() -> None:
             self.checking_cloud = False
-            self.btn_check.configure(state=tk.NORMAL)
+            if not self.ota_running:
+                self._set_controls_enabled(True)
+                self.btn_start.configure(state=tk.NORMAL)
 
         self.ui_call(_done)
 
-    def _fetch_mock_cloud(self) -> tuple:
+    def _fetch_mock_cloud(self, local_path: str) -> tuple:
         """Mock 模式：等待 0.5 秒，返回模拟元数据字典并读取本地 app.bin；不访问真实云端。"""
         self.log("Mock 模式: 模拟 0.5 秒网络延迟 ...")
         time.sleep(0.5)
@@ -589,10 +656,9 @@ class OTAGuiApp:
         }
         self.log(f"Mock 模式: 收到云端 JSON -> {info}")
 
-        path = self.local_path_var.get().strip()
         candidates = []
-        if path:
-            candidates.append(path)
+        if local_path:
+            candidates.append(local_path)
         candidates.append(os.path.join(os.path.dirname(os.path.abspath(__file__)), FIRMWARE_FILENAME))
         candidates.append(os.path.join(os.getcwd(), FIRMWARE_FILENAME))
 
@@ -602,6 +668,9 @@ class OTAGuiApp:
                     data = f.read()
                 if not data:
                     raise RuntimeError(f"固件文件为空: {cand}")
+                validate_firmware_size(len(data))
+                info["latest_version"] = firmware_version_from_bin(data)
+                info["crc32"] = f"{zlib.crc32(data) & 0xFFFFFFFF:08X}"
                 self.log(f"Mock 模式: 已读取本地固件 {cand} 共 {len(data)} 字节")
                 info["size"] = len(data)
                 self.ui_call(self.local_path_var.set, os.path.abspath(cand))
@@ -612,16 +681,15 @@ class OTAGuiApp:
             f"请将固件放置到程序目录后重试。"
         )
 
-    def _fetch_real_cloud(self) -> tuple:
+    def _fetch_real_cloud(self, url: str, local_ver: Optional[str]) -> tuple:
         """真实模式：请求 API 解析 JSON，并通过 download_url 下载固件。"""
-        url = self.api_url_var.get().strip()
         if not url:
             raise RuntimeError("云端 API 地址不能为空")
         self.log(f"请求云端 API: {url}")
         try:
-            resp = requests.get(url, timeout=CLOUD_TIMEOUT_S)
-            resp.raise_for_status()
-            info = resp.json()
+            with requests.get(url, timeout=CLOUD_TIMEOUT_S, headers={"Cache-Control": "no-cache"}) as resp:
+                resp.raise_for_status()
+                info = resp.json()
         except requests.RequestException as e:
             raise RuntimeError(f"HTTP 请求失败: {e}") from e
         except ValueError as e:
@@ -630,13 +698,22 @@ class OTAGuiApp:
         if not isinstance(info, dict):
             raise RuntimeError("云端 JSON 格式错误，应为对象")
 
-        for key in ("latest_version", "download_url"):
+        for key in ("latest_version", "download_url", "size", "crc32"):
             if key not in info:
                 raise RuntimeError(f"云端 JSON 缺少必要字段: {key}")
 
+        if not isinstance(info["latest_version"], str):
+            raise RuntimeError("云端 latest_version 必须为版本字符串。")
+        firmware_version_code(info["latest_version"])
+        if type(info["size"]) is not int:
+            raise RuntimeError("云端 size 必须为固件字节数。")
+        validate_firmware_size(info["size"])
+        if not isinstance(info["crc32"], str) or not re.fullmatch(r"[0-9a-fA-F]{8}", info["crc32"]):
+            raise RuntimeError("云端 crc32 必须为 8 位十六进制字符串。")
+        if not isinstance(info["download_url"], str) or not info["download_url"].startswith("https://"):
+            raise RuntimeError("云端 download_url 必须为 HTTPS 固件下载地址。")
         self.log(f"云端 JSON 解析成功: {info}")
 
-        local_ver = self.device_version
         data: Optional[bytes] = None
         if local_ver is None or is_newer_version(str(info.get("latest_version", "")), local_ver):
             dl_url = str(info.get("download_url", "")).strip()
@@ -644,20 +721,30 @@ class OTAGuiApp:
                 raise RuntimeError("download_url 为空，无法下载固件")
             self.log(f"开始下载云端固件: {dl_url}")
             try:
-                r = requests.get(dl_url, timeout=DOWNLOAD_TIMEOUT_S)
-                r.raise_for_status()
-                data = r.content
+                with requests.get(dl_url, timeout=DOWNLOAD_TIMEOUT_S, stream=True) as response:
+                    response.raise_for_status()
+                    downloaded = bytearray()
+                    for chunk in response.iter_content(chunk_size=4096):
+                        downloaded.extend(chunk)
+                        if len(downloaded) > info["size"]:
+                            raise RuntimeError("下载数据超过云端声明的固件大小，已停止下载。")
+                    data = bytes(downloaded)
             except requests.RequestException as e:
                 raise RuntimeError(f"固件下载失败: {e}") from e
-            if not data:
-                raise RuntimeError("下载的固件数据为空")
-            info["size"] = len(data)
-            self.log(f"固件下载完成，共 {len(data)} 字节", "OK")
+            if len(data) != info["size"]:
+                raise RuntimeError(f"下载大小不一致：期望 {info['size']}，收到 {len(data)} 字节。")
+            actual_crc = f"{zlib.crc32(data) & 0xFFFFFFFF:08X}"
+            if actual_crc != info["crc32"].upper():
+                raise RuntimeError(f"云端固件 CRC32 不一致：期望 {info['crc32']}，收到 {actual_crc}。")
+            binary_version = firmware_version_from_bin(data)
+            if firmware_version_code(binary_version) != firmware_version_code(info["latest_version"]):
+                raise RuntimeError(f"固件版本 {binary_version} 与云端声明 {info['latest_version']} 不一致。")
+            self.log(f"下载核验通过：{len(data)} 字节，CRC32={actual_crc}，APP 版本={binary_version}", "OK")
         return info, data
 
     # ------------------------------------------------------------ OTA 升级主流程
     def _start_ota(self) -> None:
-        if self.ota_running:
+        if self.ota_running or self.checking_cloud or self.querying_version:
             return
 
         # 固件数据准备
@@ -694,6 +781,19 @@ class OTAGuiApp:
                 return
             self.log(f"固件来源: 本地文件 {path}（{len(data)} 字节）")
 
+        try:
+            validate_firmware_size(len(data))
+            target_version = firmware_version_from_bin(data)
+            if source == "cloud":
+                declared_version = str(self.cloud_info["latest_version"])
+                if firmware_version_code(target_version) != firmware_version_code(declared_version):
+                    raise ValueError("缓存固件版本与云端信息不一致，请重新检查云端更新。")
+                target_version = declared_version
+        except (ValueError, KeyError, TypeError) as e:
+            self.log(f"固件检查失败: {e}", "ERROR")
+            messagebox.showerror("固件检查失败", str(e))
+            return
+
         if not self._require_serial():
             return
 
@@ -705,7 +805,7 @@ class OTAGuiApp:
 
         threading.Thread(
             target=self._ota_worker,
-            args=(data,),
+            args=(data, target_version),
             daemon=True,
             name="ota-worker",
         ).start()
@@ -723,22 +823,22 @@ class OTAGuiApp:
             self.path_entry,
         ):
             widget.configure(state=state)
+        if enabled:
+            self.port_combo.configure(state="readonly")
+            self.baud_combo.configure(state="readonly")
 
-    def _ota_worker(self, data: bytes) -> None:
+    def _ota_worker(self, data: bytes, target_version: str) -> None:
         """发送固件后，等待 APP 启动并查询设备实际版本。"""
         success = False
         try:
             self.log("=" * 60)
             self.log(f"开始 OTA 升级，固件总大小 {len(data)} 字节，分包大小 {CHUNK_SIZE} 字节")
 
-            if not 8 <= len(data) <= 48 * 1024:
-                raise RuntimeError("固件长度必须在 8 字节到 48 KB 之间。")
-
             self._phase_wake_bootloader()
-            self._phase_send_metadata(data)
+            self._phase_send_metadata(data, target_version)
             self._phase_erase_flash()
             self._phase_stream_chunks(data)
-            self._phase_copy_and_boot(data)
+            self._phase_copy_and_boot(data, target_version)
 
             success = True
         except Exception as e:  # noqa: BLE001
@@ -789,10 +889,10 @@ class OTAGuiApp:
         self.log(f"设备唤醒输出: {response}", "WARN")
         raise RuntimeError(f"5 秒内未确认进入 Bootloader，设备输出: {response}")
 
-    def _phase_send_metadata(self, data: bytes) -> None:
+    def _phase_send_metadata(self, data: bytes, target_version: str) -> None:
         """按 Bootloader 已有格式发送四个小端 uint32_t。"""
         crc = zlib.crc32(data) & 0xFFFFFFFF
-        version = 0x00010000  # 暂用 V1.0.0，设备尚未比较版本
+        version = firmware_version_code(target_version)
         metadata = struct.pack("<IIII", 0x55AA55AA, len(data), crc, version)
         self.log(f"固件信息: {len(data)} 字节，CRC32={crc:08X}，版本字段={version:08X}")
 
@@ -834,7 +934,7 @@ class OTAGuiApp:
         else:
             raise RuntimeError(f"阶段二握手失败：期望 b'E'，实际收到 {ack!r}，升级终止")
 
-    # ---- 阶段三：每包最多 128 字节，末包可更短；等待字符 0 应答，无包序号、重传或 CRC ----
+    # ---- 阶段三：每包最多 128 字节，末包可更短；等待字符 0 应答，无包序号、重传或独立包 CRC ----
     def _phase_stream_chunks(self, data: bytes) -> None:
         total = len(data)
         chunks = [data[i:i + CHUNK_SIZE] for i in range(0, total, CHUNK_SIZE)]
@@ -867,7 +967,7 @@ class OTAGuiApp:
         self.log(f"阶段三完成: 全部 {total_pkts} 个分包均收到 ACK '0'", "OK")
 
     # ---- 阶段四：请求搬运，确认 APP 启动后查询版本 ----
-    def _phase_copy_and_boot(self, data: bytes) -> None:
+    def _phase_copy_and_boot(self, data: bytes, target_version: str) -> None:
         self.log("阶段四: 所有分包传输完毕，准备片内 Flash 搬迁 ...")
         time.sleep(0.5)
 
@@ -883,6 +983,8 @@ class OTAGuiApp:
         self._wait_for_app_start()
         new_ver = self._query_app_version()
         self.ui_call(self._set_device_version, new_ver)
+        if firmware_version_code(new_ver) != firmware_version_code(target_version):
+            raise RuntimeError(f"APP 已启动，但实际版本 {new_ver} 与目标版本 {target_version} 不一致。")
         self.log(f"设备实际返回的当前版本: {new_ver}", "OK")
 
         total = len(data)
@@ -900,7 +1002,7 @@ class OTAGuiApp:
         )
 
     def _wait_for_app_start(self) -> None:
-        """只读取启动输出；未确认 APP 前不能向 Bootloader 发送 V。"""
+        """安装阶段先等 APP 启动提示，随后查询版本以确认安装结果。"""
         received = bytearray()
         previous_timeout = self.ser.timeout
         errors = (b"CRC check failed", b"APP CRC failed", b"Erase Failed!", b"Meta Read Err!")
@@ -932,18 +1034,21 @@ class OTAGuiApp:
         )
 
     def _query_app_version(self) -> str:
-        """仅在本轮已确认 APP 启动后，发送一个 V 并等待完整版本回复。"""
+        """发送一个 V 并等待版本回复；Bootloader 需能安全忽略 V。"""
+        ser = self.ser
+        if ser is None or not ser.is_open:
+            raise RuntimeError("串口未连接，无法查询设备版本。")
         received = bytearray()
-        previous_timeout = self.ser.timeout
+        previous_timeout = ser.timeout
         try:
-            self.ser.timeout = 0.1
-            self.ser.reset_input_buffer()
-            self.ser.write(b"V")
-            self.ser.flush()
+            ser.timeout = 0.1
+            ser.reset_input_buffer()
+            ser.write(b"V")
+            ser.flush()
             self.log("发送 V，查询 APP 实际版本 ...")
             deadline = time.monotonic() + VERSION_TIMEOUT_S
             while time.monotonic() < deadline:
-                received.extend(self.ser.read(self.ser.in_waiting or 1))
+                received.extend(ser.read(ser.in_waiting or 1))
                 while b"\n" in received:
                     line, _, remainder = received.partition(b"\n")
                     received = bytearray(remainder)
@@ -964,10 +1069,10 @@ class OTAGuiApp:
         except (serial.SerialException, OSError) as e:
             raise RuntimeError(f"查询 APP 版本时串口通信失败: {e}") from e
         finally:
-            self.ser.timeout = previous_timeout
+            ser.timeout = previous_timeout
 
         raise RuntimeError(
-            f"APP 已启动，但 {VERSION_TIMEOUT_S} 秒内未收到完整的 APP_VERSION 回复，版本未确认。"
+            f"{VERSION_TIMEOUT_S} 秒内未收到完整的 APP_VERSION 回复，设备可能未进入 APP 或串口链路未就绪。"
         )
 
     # ------------------------------------------------------------ 退出

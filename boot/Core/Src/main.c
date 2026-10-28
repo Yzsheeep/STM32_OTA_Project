@@ -414,6 +414,10 @@ void HAL_UARTEx_RxEventCallback(UART_HandleTypeDef *huart, uint16_t Size)
         {
             cmd_flag = 4; // 提交搬运任务
         }
+        else if (Size == 1 && rx_buffer[0] == 'V')
+        {
+            // 收到版本查询，不做任何操作
+        }
         else
         {
             rx_len = Size; // 本次接收长度，可能不足一包
