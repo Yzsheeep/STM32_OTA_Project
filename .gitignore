@@ -32,3 +32,6 @@ rollback-backups/
 __pycache__/
 /app.bin
 *.uvguix.*
+# F411 Keil 编译输出目录
+/app_f411/MDK-ARM/app_f411/
+/boot_f411/MDK-ARM/boot_f411/
