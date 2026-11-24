@@ -25,6 +25,7 @@
 
 /* Private includes ----------------------------------------------------------*/
 /* USER CODE BEGIN Includes */
+#include "oled.h"
 #include <string.h>
 #include <stdio.h>
 
@@ -37,6 +38,11 @@
 
 /* Private define ------------------------------------------------------------*/
 /* USER CODE BEGIN PD */
+// 与 F411 Boot 约定，试运行请求和确认共用 EEPROM 的一个字节。
+#define TRIAL_MARK_ADDR 0x90U
+#define TRIAL_PENDING   0x59U
+#define TRIAL_CONFIRMED 0xA6U
+#define APP_VERSION "1.0.8"
 
 /* USER CODE END PD */
 
@@ -52,7 +58,7 @@ uint8_t app_rx_buf[10] = {0}; // App 串口接收缓冲区
 volatile uint8_t need_reboot_to_ota = 0; // 升级请求：回调置 1，主循环处理
 volatile uint8_t need_report_version = 0;
 volatile uint8_t uart_error_pending = 0; // 中断置 1，主循环读取这块内存并恢复接收
-uint8_t app_version_msg[] = "APP_VERSION=1.0.3\r\n";
+uint8_t app_version_msg[] = "APP_VERSION=" APP_VERSION "\r\n";
 /* USER CODE END PV */
 
 /* Private function prototypes -----------------------------------------------*/
@@ -102,9 +108,12 @@ int main(void)
   MX_SPI1_Init();
   MX_USART1_UART_Init();
   /* USER CODE BEGIN 2 */
-  HAL_UART_Transmit(&huart1, (uint8_t *)"Hello! I am App in 2nd Floor!\r\n", 31, 1000);
-
-  HAL_UARTEx_ReceiveToIdle_IT(&huart1, app_rx_buf, sizeof(app_rx_buf));
+  uint8_t trial_mark;
+  if (HAL_I2C_Mem_Read(&hi2c2, 0xA0, TRIAL_MARK_ADDR, I2C_MEMADD_SIZE_8BIT, &trial_mark, 1, 100) != HAL_OK)
+      Error_Handler();
+  uint8_t startup_message_pending = (trial_mark != TRIAL_PENDING);
+  if (HAL_UARTEx_ReceiveToIdle_IT(&huart1, app_rx_buf, sizeof(app_rx_buf)) != HAL_OK)
+      uart_error_pending = 1; // 首次开启接收也可能遇到 ORE，交给主循环恢复
   /* USER CODE END 2 */
 
   /* Infinite loop */
@@ -123,6 +132,33 @@ int main(void)
       }
     }
 
+    if (startup_message_pending && !uart_error_pending)
+    {
+        HAL_UART_Transmit(&huart1, (uint8_t *)"Hello! I am App in 2nd Floor!\r\n", 31, 1000);
+        OLED_Init();
+        // OLED_Init 已清空显存，两行画完再刷屏。
+        OLED_PrintASCIIString(0, 0, "App running", &afont16x8, OLED_COLOR_NORMAL);
+        OLED_PrintASCIIString(0, 16, "V" APP_VERSION, &afont16x8, OLED_COLOR_NORMAL);
+        OLED_ShowFrame();
+        startup_message_pending = 0;
+    }
+
+    if (trial_mark == TRIAL_PENDING)
+    {
+        // 让主循环完成一次 LED 和 SysTick 延时，串口已挂接，再确认新版。
+        HAL_GPIO_TogglePin(GPIOC, GPIO_PIN_13);
+        HAL_Delay(500);
+        uint8_t confirmed = TRIAL_CONFIRMED;
+        if (uart_error_pending)
+            continue; // 先恢复接收；持续失败时由试运行看门狗复位
+        if (HAL_I2C_Mem_Write(&hi2c2, 0xA0, TRIAL_MARK_ADDR, I2C_MEMADD_SIZE_8BIT, &confirmed, 1, 100) != HAL_OK)
+            Error_Handler(); // 试运行看门狗仍在计时
+        HAL_Delay(10);
+        if (HAL_I2C_Mem_Read(&hi2c2, 0xA0, TRIAL_MARK_ADDR, I2C_MEMADD_SIZE_8BIT, &trial_mark, 1, 100) != HAL_OK ||
+            trial_mark != TRIAL_CONFIRMED)
+            Error_Handler();
+        NVIC_SystemReset(); // Boot 校验片内新版，提交 NORMAL，再正常启动
+    }
     if (need_reboot_to_ota)
     {
       need_reboot_to_ota = 0;
@@ -135,7 +171,7 @@ int main(void)
         HAL_UART_Transmit(&huart1,app_version_msg,sizeof(app_version_msg) - 1U,1000);
     }
 	  HAL_GPIO_TogglePin(GPIOC,GPIO_PIN_13);
-	  HAL_Delay(2000);
+	  HAL_Delay(500);
    
     
     /* USER CODE END WHILE */
@@ -245,7 +281,8 @@ void HAL_UARTEx_RxEventCallback(UART_HandleTypeDef *huart,uint16_t Size)
             need_report_version = 1;
         }
 
-        HAL_UARTEx_ReceiveToIdle_IT(&huart1, app_rx_buf, sizeof(app_rx_buf));
+        if (HAL_UARTEx_ReceiveToIdle_IT(&huart1, app_rx_buf, sizeof(app_rx_buf)) != HAL_OK)
+            uart_error_pending = 1;
     }
 }
 

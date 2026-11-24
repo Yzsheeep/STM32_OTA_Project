@@ -396,6 +396,16 @@
               <FilePath>../Core/Src/main.c</FilePath>
             </File>
             <File>
+              <FileName>oled.c</FileName>
+              <FileType>1</FileType>
+              <FilePath>../Core/Src/oled.c</FilePath>
+            </File>
+            <File>
+              <FileName>font.c</FileName>
+              <FileType>1</FileType>
+              <FilePath>../Core/Src/font.c</FilePath>
+            </File>
+            <File>
               <FileName>gpio.c</FileName>
               <FileType>1</FileType>
               <FilePath>../Core/Src/gpio.c</FilePath>

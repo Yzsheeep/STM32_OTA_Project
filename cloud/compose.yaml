@@ -1,0 +1,22 @@
+name: f411-firmware
+services:
+  api:
+    build: .
+    restart: unless-stopped
+    ports:
+      - "127.0.0.1:${OTA_HOST_PORT:-18080}:18080"
+    volumes:
+      - firmware_data:/data
+    secrets:
+      - admin_token
+    read_only: true
+    cap_drop: [ALL]
+    security_opt:
+      - no-new-privileges:true
+    mem_limit: 192m
+    pids_limit: 64
+volumes:
+  firmware_data:
+secrets:
+  admin_token:
+    file: ${OTA_TOKEN_FILE:?Set the path to a readable token file outside the checkout}

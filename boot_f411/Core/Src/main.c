@@ -27,6 +27,8 @@
 /* USER CODE BEGIN Includes */
 #include "bootloader.h"
 #include "w25q64.h"
+#include "oled.h"
+#include <stdio.h>
 /* USER CODE END Includes */
 
 /* Private typedef -----------------------------------------------------------*/
@@ -74,27 +76,7 @@ void SystemClock_Config(void);
 
 /* Private user code ---------------------------------------------------------*/
 /* USER CODE BEGIN 0 */
-uint32_t CRC32_Update(uint32_t crc, const uint8_t *data, uint32_t len)
-{
-    for (uint32_t i = 0; i < len; i++) // 依次处理这段数据的每个字节
-    {
-        crc ^= data[i]; // 将当前字节合入 CRC
 
-        for (uint8_t bit = 0; bit < 8; bit++) // 一个字节包含 8 位，处理 8 次
-        {
-            if ((crc & 1U) != 0U) // 检查 CRC 当前最低位是否为 1
-            {
-                crc = (crc >> 1) ^ 0xEDB88320U; // 右移一位，再与算法常数异或
-            }
-            else
-            {
-                crc >>= 1; // 最低位为 0，只右移一位
-            }
-        }
-    }
-
-    return crc; // 返回处理完这段数据后的 CRC，供下一段继续使用
-}
 /* USER CODE END 0 */
 
 /**
@@ -131,15 +113,35 @@ int main(void)
   MX_SPI1_Init();
   MX_USART1_UART_Init();
   /* USER CODE BEGIN 2 */
+  HAL_Delay(20);
+  OLED_Init();
+
    HAL_UART_Transmit(&huart1, (uint8_t *)"Bootloader ready!\r\n", 19, 1000);
 
 
+  if (Bootloader_Recover() != HAL_OK)
+  {
+      OLED_ShowStatus("Recovery stopped");
+      HAL_UART_Transmit(&huart1, (uint8_t *)"OTA recovery stopped\r\n", sizeof("OTA recovery stopped\r\n") - 1U, 1000);
+      Error_Handler(); // 保留 EEPROM 和两个镜像，复位后按持久状态再处理
+  }
+  uint32_t last_activity = HAL_GetTick();
+  uint8_t have_meta = 0;
+  uint8_t staging_ready = 0;
+  uint32_t last_step = 0;   // 已显示的进度档位：1 表示 10%，10 表示 100%
   OTA_MetaInfo_t current_meta; // 启动时读取的 EEPROM 固件信息
   Bootloader_ReadMeta(&current_meta);
   
 
   if (current_meta.ota_flag == OTA_FLAG_UPDATE)
   {
+      current_meta.ota_flag = OTA_FLAG_NORMAL; // 只消费一次 U；接收期间复位仍能启动旧版
+      if (Bootloader_WriteMeta(&current_meta) != HAL_OK)
+      {
+          OLED_ShowStatus("EEPROM error");
+          Error_Handler();
+      }
+      OLED_ShowStatus("OTA READY");
       HAL_UART_Transmit(&huart1, (uint8_t *)"Wait for OTA update...\r\n", 24, 1000);
   }
   else
@@ -170,6 +172,10 @@ int main(void)
         {
             uart_error_pending = 1; // 开启失败，下一轮再次尝试恢复
         }
+        else
+        {
+            OLED_ShowStatus("UART recovered");
+        }
     }
     /* 距上次翻转达到 500 ms 才切换小灯，其余时间继续处理串口任务。 */
     if ((uint32_t)(HAL_GetTick() - led_tick) >= 500U)
@@ -186,21 +192,27 @@ int main(void)
      if (cmd_flag != 6)
      {
          uint8_t ack = 'N'; // 失败应答
+         OLED_ShowStatus("Meta timeout");
          HAL_UARTEx_ReceiveToIdle_IT(&huart1, rx_buffer, sizeof(rx_buffer));
          HAL_UART_Transmit(&huart1, &ack, 1, 100);
      }
     }
+    if (cmd_flag != 0U)
+        last_activity = HAL_GetTick();
+    else if ((uint32_t)(HAL_GetTick() - last_activity) >= 60000U)
+    {
+        OLED_ShowStatus("OTA timeout");
+        NVIC_SystemReset(); // 传输放弃，重新启动已确认的 App
+    }
+
     switch (cmd_flag)
     {
         case 1: // 设置升级标志
             {
-                OTA_MetaInfo_t meta = {0}; // 读取原记录，仅修改升级标志
                 cmd_flag = 0;
-
-                Bootloader_ReadMeta(&meta);
-                meta.ota_flag = OTA_FLAG_UPDATE;
-                Bootloader_WriteMeta(&meta);
-
+                have_meta = 0;
+                staging_ready = 0;
+                OLED_ShowStatus("OTA READY");
                 HAL_UART_Transmit(&huart1, (uint8_t *)"Set Flag OK!\r\n", 14, 100);
                 break;
             }
@@ -210,6 +222,9 @@ int main(void)
                 uint8_t ack = 'h'; // 小写 h：准备接收固件信息
                 cmd_flag = 0;
 
+                have_meta = 0;
+                staging_ready = 0;
+                OLED_ShowStatus("Reading metadata");
                 meta_start_tick = HAL_GetTick();
                 meta_waiting = 1;
 
@@ -218,6 +233,7 @@ int main(void)
                 {
                     meta_waiting = 0;
                     ack = 'N';
+                    OLED_ShowStatus("Meta RX error");
                     HAL_UARTEx_ReceiveToIdle_IT(&huart1, rx_buffer, sizeof(rx_buffer));
                 }
 
@@ -227,126 +243,97 @@ int main(void)
 
         case 3: // 擦除w25q64
             {
-                // 沿用 16 KB 暂存区，后续扩容时同步修改上限和擦除范围
-                // addr：扇区地址，步长 4 KB
-                for (uint32_t addr = 0; addr < OTA_STAGING_SIZE; addr += 0x1000)
-                {
-                    W25Q64_Erase_Sector(addr);
-                }
-                current_write_addr = 0x000000;
+                uint8_t ack = 'N';
+                HAL_StatusTypeDef result = HAL_OK;
 
-                // 擦除调用结束后应答，未校验结果
-                uint8_t ack = 'E'; // 擦除流程应答
-                HAL_UART_Transmit(&huart1, &ack, 1, 100);
                 cmd_flag = 0;
+
+                staging_ready = 0;
+                if (!have_meta)
+                {
+                    OLED_ShowStatus("Metadata needed");
+                    HAL_UART_Transmit(&huart1, &ack, 1, 100);
+                    break;
+                }
+                OLED_ShowStatus("Erasing staging");
+                for (uint32_t addr = 0; addr < OTA_STAGING_SIZE;
+                    addr += 4096U)
+                {
+                    result = W25Q64_Erase_Sector(addr);
+
+                    if (result != HAL_OK)
+                    {
+                        break; // 某个扇区失败，停止后续擦除
+                    }
+                }
+
+                if (result == HAL_OK)
+                {
+                    current_write_addr = 0;
+                    last_step = 0;
+                    OLED_ShowStatus("Receiving 0%");
+                    staging_ready = 1;
+                    ack = 'E';
+                }
+                else
+                {
+                    OLED_ShowStatus("Erase failed");
+                }
+
+                HAL_UART_Transmit(&huart1, &ack, 1, 100);
             }
             break;
 
-        case 4: // 将外部固件搬运到 App 分区
+        case 4:
             {
-                OTA_MetaInfo_t meta; // EEPROM 固件信息
-                Bootloader_ReadMeta(&meta);
-
-                // 先检查暂存区容量及 4 字节对齐，再校验外部固件 CRC
-                if (meta.firmware_size < 8U || meta.firmware_size > OTA_STAGING_SIZE || meta.firmware_size % 4U != 0U)
-                {
-                    cmd_flag = 0;
-                    break;
-                }
-                uint8_t move_buf[256];                      // 每次读回最多256字节
-                uint32_t total_size = meta.firmware_size;   // 固件总字节数
-                uint32_t check_addr = 0;                    // 外部Flash读取地址
-                uint32_t crc = 0xFFFFFFFFU;                 // CRC32初始值
-               while (check_addr < total_size)
-                {
-                    uint16_t chunk = 256; // 默认读取256字节
-
-                    if (total_size - check_addr < 256)
-                    {
-                        chunk = total_size - check_addr; // 最后一块只读剩余字节
-                    }
-
-                    W25Q64_Read_Data(check_addr, move_buf, chunk);
-
-                    crc = CRC32_Update(crc, move_buf, chunk); // 接着计算本次读回的数据
-
-                    check_addr += chunk; // 下一块的起始地址
-                }
-                crc ^= 0xFFFFFFFFU; // 整份固件处理完，最终取反
-
-                if (crc != meta.firmware_crc32)
-                {
-                    HAL_UART_Transmit(&huart1, (uint8_t *)"CRC check failed\r\n", 18, 1000);
-                    cmd_flag = 0;
-                    break; // 退出当前case，不执行下面的擦除
-                }
-
-                /* F411 按扇区擦除 App；失败时退出，不继续搬运。 */
-                if (Bootloader_EraseApp() != HAL_OK)
-                {
-                    cmd_flag = 0;
-                    break; // 擦除失败，退出当前 case，不继续搬运
-                }
-
-                
-                uint32_t src_addr = 0x000000; // W25Q64 读取地址
-                uint32_t dst_addr = APP_FLASH_ADDR; // 内部 Flash 写入地址
-                 // 固件总长度（字节）
-                uint32_t copied = 0; // 累计搬运字节数，未校验结果
-                HAL_StatusTypeDef write_result = HAL_OK;
-
-                while (copied < total_size)
-                {
-                    uint16_t chunk = (total_size - copied > 256) ? 256 : (total_size - copied); // 本轮搬运字节数，最多 256
-                    W25Q64_Read_Data(src_addr, move_buf, chunk);
-                    write_result = Bootloader_WriteFlash(dst_addr, move_buf, chunk);
-                    if (write_result != HAL_OK)
-                    {
-                        break; // 退出 while，停止搬运
-                    }
-                    src_addr += chunk;
-                    dst_addr += chunk;
-                    copied   += chunk;
-                }
-                if (write_result != HAL_OK)
-                {
-                    cmd_flag = 0;
-                    break; // 退出当前 case，跳过后续处理
-                }
-                crc = 0xFFFFFFFFU; // 开始新的 CRC 计算，重新设置初始值
-                const uint8_t *app_data = (const uint8_t *)APP_FLASH_ADDR; // 指向 APP 起始地址；app_data[i] 读取内部 Flash 的第 i 个字节
-                crc = CRC32_Update(crc, app_data, total_size); // 计算内部 App 的 CRC
-
-                crc ^= 0xFFFFFFFFU; // 全部字节处理完，最终取反
-                if (crc != meta.firmware_crc32)
-                {
-                    HAL_UART_Transmit(&huart1, (uint8_t *)"APP CRC failed\r\n", 16, 1000);
-                    cmd_flag = 0;
-                    break; // 退出当前 case，不清升级标志，也不执行后面的复位
-                }
-                // 搬运后清标志
-                meta.ota_flag = OTA_FLAG_NORMAL;
-                if(Bootloader_WriteMeta(&meta) != HAL_OK)
-                {
-                    HAL_UART_Transmit(&huart1, (uint8_t *)"Meta save failed\r\n", 18, 1000);
-                    cmd_flag = 0;
-                    break; // 退出 switch，不执行后面的复位
-                }
-
                 cmd_flag = 0;
-                HAL_Delay(100);
-                NVIC_SystemReset();
+                HAL_UART_Transmit(&huart1, (uint8_t *)"OTA managed\r\n", sizeof("OTA managed\r\n") - 1U, 1000);
+                if (!staging_ready || current_write_addr != incoming_meta.firmware_size || Bootloader_PrepareInstall(&incoming_meta) != HAL_OK)
+                {
+                    OLED_ShowStatus("Prepare failed");
+                    HAL_UART_Transmit(&huart1, (uint8_t *)"OTA prepare failed\r\n", sizeof("OTA prepare failed\r\n") - 1U, 1000);
+                }
+                NVIC_SystemReset(); // 重新加载 EEPROM，包括写入结果不确定的情况
             }
             break;
         case 5: // 写入收到的固件数据
             {
-                W25Q64_Write_Page(current_write_addr, rx_buffer, rx_len);
-                current_write_addr += rx_len;
-                
-                // 写入调用结束后应答，未读回校验
-                uint8_t ack = '0'; // 数据应答：字符 '0'
-                HAL_UART_Transmit(&huart1, &ack, 1, 100);
+                uint8_t ack = 'N';
+                HAL_StatusTypeDef result = HAL_ERROR;
+
                 cmd_flag = 0;
+
+                if (staging_ready && current_write_addr < incoming_meta.firmware_size && rx_len <= incoming_meta.firmware_size - current_write_addr)
+                {
+                    result = W25Q64_Write_Page(current_write_addr,rx_buffer, rx_len);
+                }
+
+                if (result == HAL_OK)
+                {
+                    current_write_addr += rx_len;
+                    uint32_t step = current_write_addr * 10U / incoming_meta.firmware_size;
+                    if (step > last_step)
+                    {
+                        char text[17];
+                        snprintf(text, sizeof(text), "Receiving %lu%%", (unsigned long)(step * 10U));
+                        OLED_ShowStatus(text);
+                        last_step = step;
+                    }
+                    ack = '0';
+                }
+                else
+                {
+                    OLED_ShowStatus("Packet failed");
+                }
+
+                // 本包处理结束，先准备接收下一包
+                if (HAL_UARTEx_ReceiveToIdle_IT(&huart1, rx_buffer,sizeof(rx_buffer)) != HAL_OK)
+                {
+                    uart_error_pending = 1; // 交给已有的串口恢复逻辑
+                    break; // 接收未准备好，不发送 ACK，上位机会超时中止
+                }
+
+                HAL_UART_Transmit(&huart1, &ack, 1, 100);
             }
             break;
 
@@ -357,14 +344,20 @@ int main(void)
 
                 if (incoming_meta.ota_flag == OTA_FLAG_UPDATE && incoming_meta.firmware_size >= 8U && incoming_meta.firmware_size <= OTA_STAGING_SIZE && incoming_meta.firmware_size % 4U == 0U)
                 {
+                    incoming_meta.ota_flag = OTA_FLAG_NORMAL; // 接收中复位时仍启动已确认版本
                     HAL_StatusTypeDef result = Bootloader_WriteMeta(&incoming_meta); // 保存及读回校验结果
 
                     if (result == HAL_OK)
                     {
+                        have_meta = 1;
                         ack = 'H';
                     }
                 }
 
+                if (ack == 'H')
+                    OLED_ShowStatus("Metadata OK");
+                else
+                    OLED_ShowStatus("Metadata failed");
                 HAL_UARTEx_ReceiveToIdle_IT(&huart1, rx_buffer, sizeof(rx_buffer));
                 HAL_UART_Transmit(&huart1, &ack, 1, 100);
                 break;
@@ -457,6 +450,7 @@ void HAL_UARTEx_RxEventCallback(UART_HandleTypeDef *huart, uint16_t Size)
         {
             rx_len = Size; // 本次接收长度，可能不足一包
             cmd_flag = 5;  // 提交写入任务，缓冲区仍被接收复用
+            return;
         }
 
         HAL_UARTEx_ReceiveToIdle_IT(&huart1, rx_buffer, sizeof(rx_buffer));
