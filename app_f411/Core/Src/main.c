@@ -78,6 +78,7 @@ void App_TriggerOTA_Reboot(void);
   */
 int main(void)
 {
+
   /* USER CODE BEGIN 1 */
   SCB->VTOR = 0x08010000U; // F411 差异：App 向量表地址与 Keil 链接起点一致
   __DSB();                // 确保前面的内存访问完成
@@ -114,6 +115,9 @@ int main(void)
   uint8_t startup_message_pending = (trial_mark != TRIAL_PENDING);
   if (HAL_UARTEx_ReceiveToIdle_IT(&huart1, app_rx_buf, sizeof(app_rx_buf)) != HAL_OK)
       uart_error_pending = 1; // 首次开启接收也可能遇到 ORE，交给主循环恢复
+   uint8_t oled_on = 1;                   // 1 亮屏，0 息屏
+  GPIO_PinState key_last = GPIO_PIN_SET; // 上一轮 PB0 电平（松手为高电平）
+  uint8_t led_ticks = 0;                 // 20ms 计数，满 25 次即 500ms 翻转小灯
   /* USER CODE END 2 */
 
   /* Infinite loop */
@@ -170,8 +174,25 @@ int main(void)
 
         HAL_UART_Transmit(&huart1,app_version_msg,sizeof(app_version_msg) - 1U,1000);
     }
-	  HAL_GPIO_TogglePin(GPIOC,GPIO_PIN_13);
-	  HAL_Delay(500);
+	
+	GPIO_PinState key_now = HAL_GPIO_ReadPin(GPIOB, GPIO_PIN_0);
+    if (!startup_message_pending && key_last == GPIO_PIN_SET && key_now == GPIO_PIN_RESET)
+    {
+      oled_on = !oled_on;
+      if (oled_on)
+        OLED_DisPlay_On();
+      else
+        OLED_DisPlay_Off();
+    }
+    key_last = key_now;
+
+    led_ticks++;
+    if (led_ticks >= 25U)
+    {
+      led_ticks = 0;
+      HAL_GPIO_TogglePin(GPIOC, GPIO_PIN_13);
+    }
+    HAL_Delay(20);
    
     
     /* USER CODE END WHILE */

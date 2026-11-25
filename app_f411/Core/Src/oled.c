@@ -207,3 +207,17 @@ void OLED_PrintASCIIString(uint8_t x, uint8_t y, const char *str, const ASCIIFon
     str++;
   }
 }
+
+void OLED_DisPlay_On(void)
+{
+  OLED_SendCmd(0x8D); // 电荷泵设置
+  OLED_SendCmd(0x14); // 开启电荷泵
+  OLED_SendCmd(0xAF); // 点亮屏幕
+}
+
+void OLED_DisPlay_Off(void)
+{
+  OLED_SendCmd(0x8D); // 电荷泵设置
+  OLED_SendCmd(0x10); // 关闭电荷泵
+  OLED_SendCmd(0xAE); // 关闭屏幕
+}
