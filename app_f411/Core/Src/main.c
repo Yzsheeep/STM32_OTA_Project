@@ -38,7 +38,6 @@
 
 /* Private define ------------------------------------------------------------*/
 /* USER CODE BEGIN PD */
-// 与 F411 Boot 约定，试运行请求和确认共用 EEPROM 的一个字节。
 #define TRIAL_MARK_ADDR 0x90U
 #define TRIAL_PENDING   0x59U
 #define TRIAL_CONFIRMED 0xA6U
@@ -54,10 +53,10 @@
 /* Private variables ---------------------------------------------------------*/
 
 /* USER CODE BEGIN PV */
-uint8_t app_rx_buf[10] = {0}; // App 串口接收缓冲区
-volatile uint8_t need_reboot_to_ota = 0; // 升级请求：回调置 1，主循环处理
-volatile uint8_t need_report_version = 0;
-volatile uint8_t uart_error_pending = 0; // 中断置 1，主循环读取这块内存并恢复接收
+uint8_t app_rx_buf[10] = {0};            // 串口指令接收缓冲
+volatile uint8_t need_reboot_to_ota = 0; // 收到 'U' 请求进入 Bootloader
+volatile uint8_t need_report_version = 0;// 收到 'V' 请求查询版本
+volatile uint8_t uart_error_pending = 0; // 串口异常待恢复标志
 uint8_t app_version_msg[] = "APP_VERSION=" APP_VERSION "\r\n";
 /* USER CODE END PV */
 
@@ -80,10 +79,10 @@ int main(void)
 {
 
   /* USER CODE BEGIN 1 */
-  SCB->VTOR = 0x08010000U; // F411 差异：App 向量表地址与 Keil 链接起点一致
-  __DSB();                // 确保前面的内存访问完成
-  __ISB();                // 后续指令使用更新后的配置
-  __enable_irq();         // 设置向量表后，恢复 Bootloader 关闭的可屏蔽中断
+  SCB->VTOR = 0x08010000U; // 重映射中断向量表到 App 起始地址
+  __DSB();
+  __ISB();
+  __enable_irq();
   /* USER CODE END 1 */
 
   /* MCU Configuration--------------------------------------------------------*/
@@ -114,10 +113,10 @@ int main(void)
       Error_Handler();
   uint8_t startup_message_pending = (trial_mark != TRIAL_PENDING);
   if (HAL_UARTEx_ReceiveToIdle_IT(&huart1, app_rx_buf, sizeof(app_rx_buf)) != HAL_OK)
-      uart_error_pending = 1; // 首次开启接收也可能遇到 ORE，交给主循环恢复
-   uint8_t oled_on = 1;                   // 1 亮屏，0 息屏
-  GPIO_PinState key_last = GPIO_PIN_SET; // 上一轮 PB0 电平（松手为高电平）
-  uint8_t led_ticks = 0;                 // 20ms 计数，满 25 次即 500ms 翻转小灯
+      uart_error_pending = 1;
+  uint8_t oled_on = 1;
+  GPIO_PinState key_last = GPIO_PIN_SET;
+  uint8_t led_ticks = 0;
   /* USER CODE END 2 */
 
   /* Infinite loop */
@@ -126,13 +125,13 @@ int main(void)
   {
     if (uart_error_pending)
     {
-      uart_error_pending = 0; // 先清标记，新错误仍能再次置 1
-      HAL_UART_AbortReceive(&huart1); // 结束原来未完成的接收
-      __HAL_UART_CLEAR_OREFLAG(&huart1); // 读取状态和数据寄存器，清除接收溢出
+      uart_error_pending = 0;
+      HAL_UART_AbortReceive(&huart1);
+      __HAL_UART_CLEAR_OREFLAG(&huart1);
 
       if (HAL_UARTEx_ReceiveToIdle_IT(&huart1, app_rx_buf, sizeof(app_rx_buf)) != HAL_OK)
       {
-        uart_error_pending = 1; // 开启失败，下一轮主循环再尝试
+        uart_error_pending = 1;
       }
     }
 
@@ -140,7 +139,6 @@ int main(void)
     {
         HAL_UART_Transmit(&huart1, (uint8_t *)"Hello! I am App in 2nd Floor!\r\n", 31, 1000);
         OLED_Init();
-        // OLED_Init 已清空显存，两行画完再刷屏。
         OLED_PrintASCIIString(0, 0, "App running", &afont16x8, OLED_COLOR_NORMAL);
         OLED_PrintASCIIString(0, 16, "V" APP_VERSION, &afont16x8, OLED_COLOR_NORMAL);
         OLED_ShowFrame();
@@ -149,19 +147,19 @@ int main(void)
 
     if (trial_mark == TRIAL_PENDING)
     {
-        // 让主循环完成一次 LED 和 SysTick 延时，串口已挂接，再确认新版。
+        // 试运行自检通过后写入确认标记并复位转正
         HAL_GPIO_TogglePin(GPIOC, GPIO_PIN_13);
         HAL_Delay(500);
         uint8_t confirmed = TRIAL_CONFIRMED;
         if (uart_error_pending)
-            continue; // 先恢复接收；持续失败时由试运行看门狗复位
+            continue;
         if (HAL_I2C_Mem_Write(&hi2c2, 0xA0, TRIAL_MARK_ADDR, I2C_MEMADD_SIZE_8BIT, &confirmed, 1, 100) != HAL_OK)
-            Error_Handler(); // 试运行看门狗仍在计时
+            Error_Handler();
         HAL_Delay(10);
         if (HAL_I2C_Mem_Read(&hi2c2, 0xA0, TRIAL_MARK_ADDR, I2C_MEMADD_SIZE_8BIT, &trial_mark, 1, 100) != HAL_OK ||
             trial_mark != TRIAL_CONFIRMED)
             Error_Handler();
-        NVIC_SystemReset(); // Boot 校验片内新版，提交 NORMAL，再正常启动
+        NVIC_SystemReset();
     }
     if (need_reboot_to_ota)
     {
@@ -170,7 +168,7 @@ int main(void)
     }
     if (need_report_version)
     {
-        need_report_version = 0; // 清除请求，避免每轮重复发送
+        need_report_version = 0;
 
         HAL_UART_Transmit(&huart1,app_version_msg,sizeof(app_version_msg) - 1U,1000);
     }
@@ -250,8 +248,8 @@ void SystemClock_Config(void)
 /* USER CODE BEGIN 4 */
 void App_TriggerOTA_Reboot(void)
 {
-    uint8_t flag[4] = {0xAA, 0x55, 0xAA, 0x55}; // EEPROM 地址 0~3 依次存 AA 55 AA 55，按小端读取为 0x55AA55AA
-    uint8_t readback[4] = {0}; // EEPROM 读回值，用于核对
+    uint8_t flag[4] = {0xAA, 0x55, 0xAA, 0x55}; // 小端写入 0x55AA55AA
+    uint8_t readback[4] = {0};
 
     if (HAL_I2C_Mem_Write(&hi2c2,0xA0,0x00,I2C_MEMADD_SIZE_8BIT,flag,sizeof(flag),100) != HAL_OK)
     {
@@ -259,7 +257,7 @@ void App_TriggerOTA_Reboot(void)
         return;
     }
 
-    uint32_t start = HAL_GetTick(); // 等待起始时间（ms）
+    uint32_t start = HAL_GetTick();
     while (HAL_I2C_IsDeviceReady(&hi2c2, 0xA0, 1, 2) != HAL_OK)
     {
         if ((uint32_t)(HAL_GetTick() - start) >= 20U)
@@ -285,10 +283,9 @@ void App_TriggerOTA_Reboot(void)
         return;
     }
 
-    NVIC_SystemReset(); // 标志写入并校验通过后复位，由 Bootloader 接管
+    NVIC_SystemReset();
 }
 
-// huart：串口句柄；Size：本次接收字节数
 void HAL_UARTEx_RxEventCallback(UART_HandleTypeDef *huart,uint16_t Size)
 {
     if (huart->Instance == USART1)
@@ -311,7 +308,7 @@ void HAL_UART_ErrorCallback(UART_HandleTypeDef *huart)
 {
     if (huart->Instance == USART1)
     {
-        uart_error_pending = 1; // 中断里只提恢复请求，由主循环处理
+        uart_error_pending = 1;
     }
 }
 /* USER CODE END 4 */

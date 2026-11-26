@@ -49,23 +49,22 @@
 /* Private variables ---------------------------------------------------------*/
 
 /* USER CODE BEGIN PV */
-OTA_MetaInfo_t incoming_meta = {0}; // 上位机发来的固件信息（16 字节）
+OTA_MetaInfo_t incoming_meta = {0};     // 待升级固件 16B 元数据
 
-volatile uint8_t meta_waiting = 0; // 固件信息接收中：1=是，0=否
-uint32_t meta_start_tick = 0; // 固件信息接收起始时间（ms）
+volatile uint8_t meta_waiting = 0;      // 正在等待接收 16B 元数据
+uint32_t meta_start_tick = 0;
 
-uint8_t rx_buffer[256] = {0}; // 串口接收缓冲区
-uint32_t current_write_addr = 0x000000; // W25Q64 下次写入地址
+uint8_t rx_buffer[256] = {0};           // 串口接收缓冲
+uint32_t current_write_addr = 0x000000; // W25Q64 暂存区当前写入偏移
 
-// 任务编号：0=空闲，1=设置升级标志，2=准备接收固件信息，3=擦外部 Flash
-// 4=搬运固件，5=写入固件数据，6=保存固件信息
-volatile uint8_t cmd_flag = 0; // 待执行任务，由串口回调设置
-volatile uint16_t rx_len = 0; // 本次接收长度（字节）
+// 0:空闲 1:置升级标志 2:准备收元数据 3:擦暂存区 4:准备安装 5:写分包 6:存元数据
+volatile uint8_t cmd_flag = 0;
+volatile uint16_t rx_len = 0;
 
-volatile uint8_t uart_error_pending = 0; // 1 表示需要恢复串口接收
-volatile uint32_t uart_last_error = 0;  // 保留最近一次错误码，方便 Keil 观察
+volatile uint8_t uart_error_pending = 0;
+volatile uint32_t uart_last_error = 0;
 
-uint32_t led_tick = 0; // 小灯上次翻转的时间
+uint32_t led_tick = 0;
 /* USER CODE END PV */
 
 /* Private function prototypes -----------------------------------------------*/
@@ -123,19 +122,19 @@ int main(void)
   {
       OLED_ShowStatus("Recovery stopped");
       HAL_UART_Transmit(&huart1, (uint8_t *)"OTA recovery stopped\r\n", sizeof("OTA recovery stopped\r\n") - 1U, 1000);
-      Error_Handler(); // 保留 EEPROM 和两个镜像，复位后按持久状态再处理
+      Error_Handler();
   }
   uint32_t last_activity = HAL_GetTick();
   uint8_t have_meta = 0;
   uint8_t staging_ready = 0;
-  uint32_t last_step = 0;   // 已显示的进度档位：1 表示 10%，10 表示 100%
-  OTA_MetaInfo_t current_meta; // 启动时读取的 EEPROM 固件信息
+  uint32_t last_step = 0;
+  OTA_MetaInfo_t current_meta;
   Bootloader_ReadMeta(&current_meta);
   
 
   if (current_meta.ota_flag == OTA_FLAG_UPDATE)
   {
-      current_meta.ota_flag = OTA_FLAG_NORMAL; // 只消费一次 U；接收期间复位仍能启动旧版
+      current_meta.ota_flag = OTA_FLAG_NORMAL; // 消费一次升级请求，避免超时复位后重复滞留 Boot
       if (Bootloader_WriteMeta(&current_meta) != HAL_OK)
       {
           OLED_ShowStatus("EEPROM error");
@@ -159,25 +158,25 @@ int main(void)
   {
     if (uart_error_pending)
     {
-        uart_error_pending = 0; // 先清请求，新错误仍可再次置 1
+        uart_error_pending = 0;
 
-        HAL_UART_AbortReceive(&huart1);    // 结束原来的接收
-        __HAL_UART_CLEAR_OREFLAG(&huart1); // 清除溢出等接收错误状态
+        HAL_UART_AbortReceive(&huart1);
+        __HAL_UART_CLEAR_OREFLAG(&huart1);
 
-        meta_waiting = 0; // 取消未完成的 16 字节固件信息接收
-        cmd_flag = 0;    // 取消尚未执行的接收任务
+        meta_waiting = 0;
+        cmd_flag = 0;
         rx_len = 0;
 
         if (HAL_UARTEx_ReceiveToIdle_IT(&huart1, rx_buffer,sizeof(rx_buffer)) != HAL_OK)
         {
-            uart_error_pending = 1; // 开启失败，下一轮再次尝试恢复
+            uart_error_pending = 1;
         }
         else
         {
             OLED_ShowStatus("UART recovered");
         }
     }
-    /* 距上次翻转达到 500 ms 才切换小灯，其余时间继续处理串口任务。 */
+
     if ((uint32_t)(HAL_GetTick() - led_tick) >= 500U)
     {
         led_tick = HAL_GetTick();
@@ -191,7 +190,7 @@ int main(void)
 
      if (cmd_flag != 6)
      {
-         uint8_t ack = 'N'; // 失败应答
+         uint8_t ack = 'N';
          OLED_ShowStatus("Meta timeout");
          HAL_UARTEx_ReceiveToIdle_IT(&huart1, rx_buffer, sizeof(rx_buffer));
          HAL_UART_Transmit(&huart1, &ack, 1, 100);
@@ -202,12 +201,12 @@ int main(void)
     else if ((uint32_t)(HAL_GetTick() - last_activity) >= 60000U)
     {
         OLED_ShowStatus("OTA timeout");
-        NVIC_SystemReset(); // 传输放弃，重新启动已确认的 App
+        NVIC_SystemReset(); // 60s 无活动自动重启回原 App
     }
 
     switch (cmd_flag)
     {
-        case 1: // 设置升级标志
+        case 1: // 'U'
             {
                 cmd_flag = 0;
                 have_meta = 0;
@@ -217,9 +216,9 @@ int main(void)
                 break;
             }
 
-        case 2: // 从上位机读取固件信息,填进结构体
+        case 2: // 'H' 握手，切定长接收 16B 元数据
             {
-                uint8_t ack = 'h'; // 小写 h：准备接收固件信息
+                uint8_t ack = 'h';
                 cmd_flag = 0;
 
                 have_meta = 0;
@@ -228,7 +227,6 @@ int main(void)
                 meta_start_tick = HAL_GetTick();
                 meta_waiting = 1;
 
-                /* 将结构体起点作为字节缓冲区：收到的 16 字节依次填入四个字段。 */
                 if (HAL_UART_Receive_IT(&huart1, (uint8_t *)&incoming_meta, sizeof(incoming_meta)) != HAL_OK)
                 {
                     meta_waiting = 0;
@@ -241,7 +239,7 @@ int main(void)
                 break;
             }    
 
-        case 3: // 擦除w25q64
+        case 3: // 'E' 擦除外部暂存区
             {
                 uint8_t ack = 'N';
                 HAL_StatusTypeDef result = HAL_OK;
@@ -263,7 +261,7 @@ int main(void)
 
                     if (result != HAL_OK)
                     {
-                        break; // 某个扇区失败，停止后续擦除
+                        break;
                     }
                 }
 
@@ -284,7 +282,7 @@ int main(void)
             }
             break;
 
-        case 4:
+        case 4: // 'C' 备份旧版并软复位进入安装
             {
                 cmd_flag = 0;
                 HAL_UART_Transmit(&huart1, (uint8_t *)"OTA managed\r\n", sizeof("OTA managed\r\n") - 1U, 1000);
@@ -293,10 +291,10 @@ int main(void)
                     OLED_ShowStatus("Prepare failed");
                     HAL_UART_Transmit(&huart1, (uint8_t *)"OTA prepare failed\r\n", sizeof("OTA prepare failed\r\n") - 1U, 1000);
                 }
-                NVIC_SystemReset(); // 重新加载 EEPROM，包括写入结果不确定的情况
+                NVIC_SystemReset();
             }
             break;
-        case 5: // 写入收到的固件数据
+        case 5: // 写入固件分包
             {
                 uint8_t ack = 'N';
                 HAL_StatusTypeDef result = HAL_ERROR;
@@ -326,26 +324,25 @@ int main(void)
                     OLED_ShowStatus("Packet failed");
                 }
 
-                // 本包处理结束，先准备接收下一包
                 if (HAL_UARTEx_ReceiveToIdle_IT(&huart1, rx_buffer,sizeof(rx_buffer)) != HAL_OK)
                 {
-                    uart_error_pending = 1; // 交给已有的串口恢复逻辑
-                    break; // 接收未准备好，不发送 ACK，上位机会超时中止
+                    uart_error_pending = 1;
+                    break;
                 }
 
                 HAL_UART_Transmit(&huart1, &ack, 1, 100);
             }
             break;
 
-        case 6: // 保存固件信息
+        case 6: // 校验并保存 16B 元数据
             {
-                uint8_t ack = 'N'; // 失败应答
+                uint8_t ack = 'N';
                 cmd_flag = 0;
 
                 if (incoming_meta.ota_flag == OTA_FLAG_UPDATE && incoming_meta.firmware_size >= 8U && incoming_meta.firmware_size <= OTA_STAGING_SIZE && incoming_meta.firmware_size % 4U == 0U)
                 {
-                    incoming_meta.ota_flag = OTA_FLAG_NORMAL; // 接收中复位时仍启动已确认版本
-                    HAL_StatusTypeDef result = Bootloader_WriteMeta(&incoming_meta); // 保存及读回校验结果
+                    incoming_meta.ota_flag = OTA_FLAG_NORMAL;
+                    HAL_StatusTypeDef result = Bootloader_WriteMeta(&incoming_meta);
 
                     if (result == HAL_OK)
                     {
@@ -420,43 +417,42 @@ void SystemClock_Config(void)
 }
 
 /* USER CODE BEGIN 4 */
-// huart：串口句柄；Size：本次接收字节数
 void HAL_UARTEx_RxEventCallback(UART_HandleTypeDef *huart, uint16_t Size)
 {
     if (huart->Instance == USART1)
     {
         if (Size <= 3 && rx_buffer[0] == 'U')
         {
-            cmd_flag = 1; // 请求升级，提交设置升级标志任务
+            cmd_flag = 1;
         }
         else if (Size == 1 && rx_buffer[0] == 'H')
         {
-            cmd_flag = 2; // 准备接收 16 字节固件信息
-            return;       // 主循环切换到定长接收，不在这里重新开启空闲接收
+            cmd_flag = 2;
+            return; // 由主循环切换定长接收
         }
         else if (Size <= 3 && rx_buffer[0] == 'E')
         {
-            cmd_flag = 3; // 提交擦除任务
+            cmd_flag = 3;
         }
         else if (Size <= 3 && rx_buffer[0] == 'C')
         {
-            cmd_flag = 4; // 提交搬运任务
+            cmd_flag = 4;
         }
         else if (Size == 1 && rx_buffer[0] == 'V')
         {
-            // 收到版本查询，不做任何操作
+            // Boot 阶段忽略版本查询
         }
         else
         {
-            rx_len = Size; // 本次接收长度，可能不足一包
-            cmd_flag = 5;  // 提交写入任务，缓冲区仍被接收复用
-            return;
+            rx_len = Size;
+            cmd_flag = 5;
+            return; // 主循环写完 Flash 后再重新挂接接收
         }
 
         HAL_UARTEx_ReceiveToIdle_IT(&huart1, rx_buffer, sizeof(rx_buffer));
     }
 }
-// 固件信息接收完成，提交保存任务
+
 void HAL_UART_RxCpltCallback(UART_HandleTypeDef *huart)
 {
     if (huart->Instance == USART1 && meta_waiting)
@@ -470,8 +466,8 @@ void HAL_UART_ErrorCallback(UART_HandleTypeDef *huart)
 {
     if (huart->Instance == USART1)
     {
-        uart_last_error = huart->ErrorCode; // 保存 HAL 记录的错误码
-        uart_error_pending = 1;             // 通知主循环恢复接收
+        uart_last_error = huart->ErrorCode;
+        uart_error_pending = 1;
     }
 }
 /* USER CODE END 4 */

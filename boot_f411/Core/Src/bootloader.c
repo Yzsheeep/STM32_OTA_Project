@@ -5,32 +5,33 @@
 #include "usart.h"
 #include <string.h>
 
+// 分段流式计算 CRC32 (多项式 0xEDB88320)
 uint32_t CRC32_Update(uint32_t crc, const uint8_t *data, uint32_t len)
 {
-    for (uint32_t i = 0; i < len; i++) // 依次处理这段数据的每个字节
+    for (uint32_t i = 0; i < len; i++)
     {
-        crc ^= data[i]; // 将当前字节合入 CRC
+        crc ^= data[i];
 
-        for (uint8_t bit = 0; bit < 8; bit++) // 一个字节包含 8 位，处理 8 次
+        for (uint8_t bit = 0; bit < 8; bit++)
         {
-            if ((crc & 1U) != 0U) // 检查 CRC 当前最低位是否为 1
+            if ((crc & 1U) != 0U)
             {
-                crc = (crc >> 1) ^ 0xEDB88320U; // 右移一位，再与算法常数异或
+                crc = (crc >> 1) ^ 0xEDB88320U;
             }
             else
             {
-                crc >>= 1; // 最低位为 0，只右移一位
+                crc >>= 1;
             }
         }
     }
 
-    return crc; // 返回处理完这段数据后的 CRC，供下一段继续使用
+    return crc;
 }
 
-// 只负责读取40字节，返回I2C通信结果
+// 从 EEPROM 指定地址读取 40B 启动记录
 static HAL_StatusTypeDef BootRecord_Read(uint16_t mem_addr, OTA_BootRecord_t *record)
 {
-    uint8_t *data = (uint8_t *)record; // 同一块结构体RAM，按字节依次填入
+    uint8_t *data = (uint8_t *)record;
     HAL_StatusTypeDef result;
 
     for (uint16_t i = 0; i < sizeof(OTA_BootRecord_t); i++)
@@ -46,10 +47,10 @@ static HAL_StatusTypeDef BootRecord_Read(uint16_t mem_addr, OTA_BootRecord_t *re
     return HAL_OK;
 }
 
-// 检查已读出的记录：1表示有效，0表示无效
+// 校验记录魔数、状态范围、CRC32 及镜像长度对齐
 static uint8_t BootRecord_IsValid(const OTA_BootRecord_t *record)
 {
-    const uint8_t *data = (const uint8_t *)record; // 按字节读取结构体，不修改它
+    const uint8_t *data = (const uint8_t *)record;
     uint32_t crc;
 
     if (record->magic != OTA_RECORD_MAGIC || record->state > OTA_STATE_RESTORING)
@@ -78,6 +79,7 @@ static uint8_t BootRecord_IsValid(const OTA_BootRecord_t *record)
     return 1;
 }
 
+// 加载 A/B 双备份记录，优先选取有效且 sequence 较新的一份
 HAL_StatusTypeDef BootRecord_Load(OTA_BootRecord_t *record, uint16_t *active_addr)
 {
     OTA_BootRecord_t record_a;
@@ -86,7 +88,7 @@ HAL_StatusTypeDef BootRecord_Load(OTA_BootRecord_t *record, uint16_t *active_add
     uint8_t valid_a;
     uint8_t valid_b;
 
-    *active_addr = 0U; // 0表示没有选出有效记录
+    *active_addr = 0U;
 
     result = BootRecord_Read(OTA_RECORD_A_MEM_ADDR, &record_a);
     if (result != HAL_OK)
@@ -105,154 +107,151 @@ HAL_StatusTypeDef BootRecord_Load(OTA_BootRecord_t *record, uint16_t *active_add
 
     if (valid_a == 0U && valid_b == 0U)
     {
-        return HAL_OK; // 通信成功，但两份记录都无效
+        return HAL_OK;
     }
 
     if (valid_a != 0U && (valid_b == 0U || record_a.sequence >= record_b.sequence))
     {
-        *record = record_a; // 将A的完整结构体复制到调用者的RAM
+        *record = record_a;
         *active_addr = OTA_RECORD_A_MEM_ADDR;
     }
     else
     {
-        *record = record_b; // 将B的完整结构体复制到调用者的RAM
+        *record = record_b;
         *active_addr = OTA_RECORD_B_MEM_ADDR;
     }
 
     return HAL_OK;
 }
+
+// 擦除片内 App 区 (Sector 4~7, 0x08010000 - 0x0807FFFF)
 HAL_StatusTypeDef Bootloader_EraseApp(void)
 {
-    FLASH_EraseInitTypeDef erase = {0}; // 创建擦除参数表，所有成员先清零
-    uint32_t sector_error = 0;          // HAL 用它返回擦除失败的扇区编号
-    HAL_StatusTypeDef result;           // 保存擦除结果
+    FLASH_EraseInitTypeDef erase = {0};
+    uint32_t sector_error = 0;
+    HAL_StatusTypeDef result;
 
-    erase.TypeErase = FLASH_TYPEERASE_SECTORS;     // 按扇区擦除
-    erase.Sector = FLASH_SECTOR_4;                // 从扇区 4 开始，即 0x08010000
-    erase.NbSectors = 4;                          // 连续擦除扇区 4、5、6、7
-    erase.VoltageRange = FLASH_VOLTAGE_RANGE_3;   // 芯片供电范围为 2.7～3.6V
+    erase.TypeErase = FLASH_TYPEERASE_SECTORS;
+    erase.Sector = FLASH_SECTOR_4;
+    erase.NbSectors = 4;
+    erase.VoltageRange = FLASH_VOLTAGE_RANGE_3;
 
-    if (HAL_FLASH_Unlock() != HAL_OK) // 擦除前先解锁，检查是否成功
+    if (HAL_FLASH_Unlock() != HAL_OK)
     {
-        return HAL_ERROR;            // 解锁失败，退出函数
+        return HAL_ERROR;
     }
 
-    result = HAL_FLASHEx_Erase(&erase, &sector_error); // 传入参数表地址，执行擦除并取得结果
+    result = HAL_FLASHEx_Erase(&erase, &sector_error);
 
-    HAL_FLASH_Lock(); // 操作结束，重新锁住 Flash
+    HAL_FLASH_Lock();
 
-    return result;   // 将擦除结果返回给调用者
+    return result;
 }
 
+// 按 32-bit Word 编程写入片内 App 区
 HAL_StatusTypeDef Bootloader_WriteFlash(uint32_t flash_addr,uint8_t *p_data, uint32_t len)
 {
-    HAL_StatusTypeDef result = HAL_OK; // 保存写入结果
+    HAL_StatusTypeDef result = HAL_OK;
 
-    if (p_data == NULL || len == 0) // 数据地址为空或没有数据，直接退出
+    if (p_data == NULL || len == 0)
     {
         return HAL_ERROR;
     }
 
-    if (flash_addr % 4U != 0 || len % 4U != 0) // 写入地址和长度都必须是 4 的倍数
+    if (flash_addr % 4U != 0 || len % 4U != 0)
     {
         return HAL_ERROR;
     }
 
-    if (flash_addr < APP_FLASH_ADDR || flash_addr >= 0x08080000U) // 起始地址必须在 APP 区内
+    if (flash_addr < APP_FLASH_ADDR || flash_addr >= 0x08080000U)
     {
         return HAL_ERROR;
     }
 
-    if (len > 0x08080000U - flash_addr) // 数据长度不能超过当前位置到 Flash 末尾的剩余空间
+    if (len > 0x08080000U - flash_addr)
     {
         return HAL_ERROR;
     }
 
-    if (HAL_FLASH_Unlock() != HAL_OK) // 写入前先解锁
+    if (HAL_FLASH_Unlock() != HAL_OK)
     {
         return HAL_ERROR;
     }
 
-    for (uint32_t i = 0; i < len; i += 4) // 每轮处理 4 字节
+    for (uint32_t i = 0; i < len; i += 4)
     {
-        uint32_t word_data;                   // 本轮准备写入的 4 字节
-        memcpy(&word_data, &p_data[i], 4);     // 从 RAM 数组中取出连续 4 字节
+        uint32_t word_data;
+        memcpy(&word_data, &p_data[i], 4);
 
-        result = HAL_FLASH_Program(FLASH_TYPEPROGRAM_WORD,flash_addr + i, word_data); // 写入内部 Flash
+        result = HAL_FLASH_Program(FLASH_TYPEPROGRAM_WORD,flash_addr + i, word_data);
 
-        if (result != HAL_OK) // 本轮失败，停止后续写入
+        if (result != HAL_OK)
         {
             break;
         }
     }
 
-    HAL_FLASH_Lock(); // 写入结束或中途失败，都重新上锁
-    return result;   // 将结果交给调用者
+    HAL_FLASH_Lock();
+    return result;
 }
 
-// App 入口函数指针类型
 typedef void (*pFunction)(void);
 
-// app_addr：App 向量表起点
+// 关闭中断与 SysTick，重设 MSP 并跳转至 App Reset_Handler
 void Bootloader_JumpToApp(uint32_t app_addr)
 {
-    // 1. 读取初始栈顶
-    uint32_t msp_val = *(volatile uint32_t *)app_addr; // App 初始栈顶地址
+    // 1. 检查向量表首项 MSP 是否在 128KB SRAM 范围内
+    uint32_t msp_val = *(volatile uint32_t *)app_addr;
 
-    // 2. 仅检查栈顶地址范围
     if (msp_val >= 0x20000000U && msp_val <= 0x20020000U)
     {
         HAL_UART_Transmit(&huart1, (uint8_t *)"Jumping to App...\r\n", 19, 1000);
 
-        // 3. 关闭可屏蔽中断和 SysTick
+        // 2. 关中断及 SysTick，防止跳入 App 初始化前触发旧中断
         __disable_irq();
         SysTick->CTRL = 0;
         SysTick->LOAD = 0;
         SysTick->VAL  = 0;
 
-        // 4. 读取 App 复位入口
-        uint32_t jump_addr = *(volatile uint32_t *)(app_addr + 4); // Reset_Handler 地址，含 Thumb 标记
-        pFunction Jump_To_Application = (pFunction)jump_addr; // App 入口函数指针
+        // 3. 取 +4 处复位向量，切换主栈指针并跳转
+        uint32_t jump_addr = *(volatile uint32_t *)(app_addr + 4);
+        pFunction Jump_To_Application = (pFunction)jump_addr;
 
-        // 5. 设置栈顶并跳转；当前编译结果需确认换栈后不再访问旧栈
         __set_MSP(msp_val);
         Jump_To_Application();
-        while (1) // App 正常不会返回；保留调用后的执行路径，避免提前执行函数收尾
+        while (1)
         {
         }
     }
     else
     {
-        // 栈顶地址无效
         HAL_UART_Transmit(&huart1, (uint8_t *)"No Valid App!\r\n", 15, 1000);
     }
 }
 
-
-/* USER CODE BEGIN ReadMeta */
+// 读取 EEPROM 0x00 处的 16B 升级元数据
 void Bootloader_ReadMeta(OTA_MetaInfo_t *meta)
 {
-    uint8_t *data = (uint8_t *)meta; // 把结构体起始地址当作字节数组起点，逐字节填入 EEPROM 数据
+    uint8_t *data = (uint8_t *)meta;
 
-    for (uint16_t i = 0; i < sizeof(OTA_MetaInfo_t); i++) // 固件信息占 16 字节，依次读取
+    for (uint16_t i = 0; i < sizeof(OTA_MetaInfo_t); i++)
     {
-        if (HAL_I2C_Mem_Read(&hi2c2, AT24C02_ADDR, OTA_META_MEM_ADDR + i,I2C_MEMADD_SIZE_8BIT, &data[i], 1, 1000) != HAL_OK) // EEPROM 第 i 字节存入结构体第 i 字节
+        if (HAL_I2C_Mem_Read(&hi2c2, AT24C02_ADDR, OTA_META_MEM_ADDR + i,I2C_MEMADD_SIZE_8BIT, &data[i], 1, 1000) != HAL_OK)
         {
             HAL_UART_Transmit(&huart1, (uint8_t *)"Meta Read Err!\r\n", 16, 1000);
             OLED_ShowStatus("Meta read error");
-            Error_Handler(); // 与原实现一致：读取失败时停止启动流程
+            Error_Handler();
         }
     }
 }
-/* USER CODE END ReadMeta */
 
-// 调用者提供页对齐的起点，长度为 8 的倍数。
+// AT24C02 按 8B 页写入并轮询内部写周期结束
 static HAL_StatusTypeDef EEPROM_WritePages(uint16_t address, uint8_t *data, uint16_t length)
 {
     HAL_StatusTypeDef result;
     for (uint16_t offset = 0; offset < length; offset += 8)
     {
-        result = HAL_I2C_Mem_Write(&hi2c2, AT24C02_ADDR,address + offset,I2C_MEMADD_SIZE_8BIT, data + offset, 8, 100); //AT24C02 的页写入一次最多处理同一页内的 8 字节
+        result = HAL_I2C_Mem_Write(&hi2c2, AT24C02_ADDR,address + offset,I2C_MEMADD_SIZE_8BIT, data + offset, 8, 100);
         if (result != HAL_OK)
         {
             return result;
@@ -272,6 +271,7 @@ static HAL_StatusTypeDef EEPROM_WritePages(uint16_t address, uint8_t *data, uint
     return HAL_OK;
 }
 
+// 写入 16B 元数据并逐字节读回核验
 HAL_StatusTypeDef Bootloader_WriteMeta(OTA_MetaInfo_t *meta)
 {
     OTA_MetaInfo_t readback = {0};
@@ -281,7 +281,6 @@ HAL_StatusTypeDef Bootloader_WriteMeta(OTA_MetaInfo_t *meta)
         return result;
     }
 
-    /* &readback 指向整块结构体；转为字节指针后依次填入 16 个字节。 */
     uint8_t *read_data = (uint8_t *)&readback;
     for (uint16_t i = 0; i < sizeof(readback); i++)
     {
@@ -294,262 +293,393 @@ HAL_StatusTypeDef Bootloader_WriteMeta(OTA_MetaInfo_t *meta)
 
     return memcmp(meta, &readback, sizeof(readback)) == 0 ? HAL_OK : HAL_ERROR;
 }
-/* USER CODE END Implementation */
 
-// 两个独立的 EEPROM 字节。迁移标记只写一次，试运行时 Boot 和 App 共用 0x90。
-#define TRIAL_MARK_ADDR  0x90U
-#define MIGRATED_ADDR    0x98U
-#define TRIAL_PENDING    0x59U
-#define TRIAL_CONFIRMED  0xA6U
-#define MIGRATED         0xD3U
+#define TRIAL_MARK_ADDR  0x90U // 试运行确认字节地址
+#define TRIAL_PENDING    0x59U // 待 App 确认
+#define TRIAL_CONFIRMED  0xA6U // App 已确认
 
-static OTA_BootRecord_t boot_record;
-static uint16_t active_addr;
-static uint8_t image_page[256]; // 启动与安装串行执行，避免占用启动栈
+static OTA_BootRecord_t boot_record; // 当前生效的启动记录
+static uint16_t active_addr;         // 当前记录地址 (0x20 或 0x60)
+static uint8_t image_page[256];      // 外部 Flash 分块读写缓冲
 
-static void Boot_Message(const char *message)
+// 写入 0x90 试运行标记并读回确认
+static HAL_StatusTypeDef WriteTrialMark(uint8_t value)
 {
-    HAL_UART_Transmit(&huart1, (uint8_t *)message, strlen(message), 1000);
-}
+    uint8_t check = 0;
 
-static HAL_StatusTypeDef ReadMark(uint16_t addr, uint8_t *value)
-{
-    return HAL_I2C_Mem_Read(&hi2c2, AT24C02_ADDR, addr, I2C_MEMADD_SIZE_8BIT, value, 1, 100);
-}
-
-static HAL_StatusTypeDef WriteMark(uint16_t addr, uint8_t value)
-{
-    uint8_t check;
-    if (HAL_I2C_Mem_Write(&hi2c2, AT24C02_ADDR, addr, I2C_MEMADD_SIZE_8BIT, &value, 1, 100) != HAL_OK)
+    if (HAL_I2C_Mem_Write(&hi2c2, AT24C02_ADDR, TRIAL_MARK_ADDR, I2C_MEMADD_SIZE_8BIT, &value, 1, 100) != HAL_OK)
+    {
         return HAL_ERROR;
-    HAL_Delay(10);
-    if (ReadMark(addr, &check) != HAL_OK || check != value)
+    }
+
+    HAL_Delay(10); // 等待 EEPROM 内部写周期
+
+    if (HAL_I2C_Mem_Read(&hi2c2, AT24C02_ADDR, TRIAL_MARK_ADDR, I2C_MEMADD_SIZE_8BIT, &check, 1, 100) != HAL_OK)
+    {
         return HAL_ERROR;
-    return HAL_OK;
+    }
+
+    return (check == value) ? HAL_OK : HAL_ERROR;
 }
 
+// 交替写入非活动副本，读回校验通过后再更新 active_addr
 static HAL_StatusTypeDef BootRecord_Save(uint32_t state)
 {
     OTA_BootRecord_t next = boot_record;
     OTA_BootRecord_t check;
     uint16_t addr = OTA_RECORD_A_MEM_ADDR;
+
     if (active_addr == OTA_RECORD_A_MEM_ADDR)
+    {
         addr = OTA_RECORD_B_MEM_ADDR;
-    if (next.sequence == UINT32_MAX)
+    }
+
+    if (next.sequence == 0xFFFFFFFFU)
+    {
         return HAL_ERROR;
+    }
 
     next.sequence++;
     next.state = state;
-    next.record_crc32 = CRC32_Update(UINT32_MAX, (const uint8_t *)&next, sizeof(next) - sizeof(uint32_t)) ^ UINT32_MAX;
+    next.record_crc32 = CRC32_Update(0xFFFFFFFFU, (const uint8_t *)&next, sizeof(next) - sizeof(uint32_t)) ^ 0xFFFFFFFFU;
+
     if (!BootRecord_IsValid(&next))
+    {
         return HAL_ERROR;
+    }
+
     if (EEPROM_WritePages(addr, (uint8_t *)&next, sizeof(next)) != HAL_OK)
+    {
         return HAL_ERROR;
+    }
+
     if (BootRecord_Read(addr, &check) != HAL_OK || memcmp(&next, &check, sizeof(next)) != 0)
+    {
         return HAL_ERROR;
+    }
+
     boot_record = next;
     active_addr = addr;
     return HAL_OK;
 }
 
-static uint8_t ImageVectorsValid(const uint8_t *image, uint32_t size)
-{
-    uint32_t stack, entry;
-    memcpy(&stack, image, 4);
-    memcpy(&entry, image + 4, 4);
-    return stack > 0x20000000U && stack <= 0x20020000U && stack % 8U == 0U &&
-           (entry & 1U) && entry >= APP_FLASH_ADDR && entry - APP_FLASH_ADDR < size;
-}
-
-static uint8_t AppMatches(uint32_t size, uint32_t crc)
+// 校验片内 App 向量表与整包 CRC32
+static uint8_t CheckInternalApp(uint32_t size, uint32_t expected_crc)
 {
     const uint8_t *app = (const uint8_t *)APP_FLASH_ADDR;
-    return size >= 8U && size <= OTA_STAGING_SIZE && ImageVectorsValid(app, size) &&
-           (CRC32_Update(UINT32_MAX, app, size) ^ UINT32_MAX) == crc;
-}
+    uint32_t stack = 0;
+    uint32_t entry = 0;
+    uint32_t crc = 0;
 
-static uint16_t PageLength(uint32_t remaining)
-{
-    return remaining > sizeof(image_page) ? sizeof(image_page) : (uint16_t)remaining;
-}
-
-static HAL_StatusTypeDef CheckExternalImage(uint32_t addr, uint32_t size, uint32_t expected)
-{
-    uint32_t crc = UINT32_MAX;
-    for (uint32_t offset = 0; offset < size; offset += sizeof(image_page))
+    if (size < 8U || size > OTA_STAGING_SIZE)
     {
-        uint16_t count = PageLength(size - offset);
+        return 0;
+    }
+
+    memcpy(&stack, app, 4);
+    memcpy(&entry, app + 4, 4);
+
+    // MSP 需落在 SRAM 内且 8B 对齐，Reset_Handler 需带 Thumb 标志位
+    if (stack <= 0x20000000U || stack > 0x20020000U || stack % 8U != 0U)
+    {
+        return 0;
+    }
+
+    if ((entry & 1U) == 0U || entry < APP_FLASH_ADDR || (entry - APP_FLASH_ADDR) >= size)
+    {
+        return 0;
+    }
+
+    crc = CRC32_Update(0xFFFFFFFFU, app, size) ^ 0xFFFFFFFFU;
+    return (crc == expected_crc) ? 1U : 0U;
+}
+
+// 分块校验 W25Q64 内镜像向量表与 CRC32
+static HAL_StatusTypeDef CheckExternalImage(uint32_t addr, uint32_t size, uint32_t expected_crc)
+{
+    uint32_t crc = 0xFFFFFFFFU;
+    uint32_t offset = 0;
+
+    if (size < 8U || size > OTA_STAGING_SIZE)
+    {
+        return HAL_ERROR;
+    }
+
+    for (offset = 0; offset < size; offset += sizeof(image_page))
+    {
+        uint16_t count = (size - offset > sizeof(image_page)) ? sizeof(image_page) : (uint16_t)(size - offset);
+
         if (W25Q64_Read_Data(addr + offset, image_page, count) != HAL_OK)
+        {
             return HAL_ERROR;
-        if (offset == 0U && !ImageVectorsValid(image_page, size))
-            return HAL_ERROR;
+        }
+
+        if (offset == 0U) // 首块顺带检查栈顶和复位向量
+        {
+            uint32_t stack = 0;
+            uint32_t entry = 0;
+            memcpy(&stack, image_page, 4);
+            memcpy(&entry, image_page + 4, 4);
+
+            if (stack <= 0x20000000U || stack > 0x20020000U || stack % 8U != 0U)
+            {
+                return HAL_ERROR;
+            }
+            if ((entry & 1U) == 0U || entry < APP_FLASH_ADDR || (entry - APP_FLASH_ADDR) >= size)
+            {
+                return HAL_ERROR;
+            }
+        }
+
         crc = CRC32_Update(crc, image_page, count);
     }
-    return (crc ^ UINT32_MAX) == expected ? HAL_OK : HAL_ERROR;
+
+    crc ^= 0xFFFFFFFFU;
+    return (crc == expected_crc) ? HAL_OK : HAL_ERROR;
 }
 
-// 仅在候选区与片内旧版都通过检查后刷新备份。此时片内旧版仍可启动。
+// 擦除片内 App 区并从 W25Q64 指定区域搬运镜像（安装与回滚复用）
+static HAL_StatusTypeDef CopyW25Q64ToApp(uint32_t source_addr, uint32_t size, uint32_t expected_crc)
+{
+    uint32_t offset = 0;
+
+    if (Bootloader_EraseApp() != HAL_OK)
+    {
+        return HAL_ERROR;
+    }
+
+    for (offset = 0; offset < size; offset += sizeof(image_page))
+    {
+        uint16_t count = (size - offset > sizeof(image_page)) ? sizeof(image_page) : (uint16_t)(size - offset);
+
+        if (W25Q64_Read_Data(source_addr + offset, image_page, count) != HAL_OK)
+        {
+            return HAL_ERROR;
+        }
+
+        if (Bootloader_WriteFlash(APP_FLASH_ADDR + offset, image_page, count) != HAL_OK)
+        {
+            return HAL_ERROR;
+        }
+    }
+
+    return CheckInternalApp(size, expected_crc) ? HAL_OK : HAL_ERROR;
+}
+
+// 从 0x4000 备份区恢复旧版 App（支持断电重入）
+static HAL_StatusTypeDef RestoreBackupApp(void)
+{
+    OTA_MetaInfo_t normal_meta = {0};
+
+    // 1. 核验外部备份区镜像完整性
+    if (CheckExternalImage(OTA_BACKUP_ADDR, boot_record.app_size, boot_record.app_crc32) != HAL_OK)
+    {
+        return HAL_ERROR;
+    }
+
+    // 2. 擦写片内前先落盘 RESTORING 状态
+    if (boot_record.state != OTA_STATE_RESTORING)
+    {
+        if (BootRecord_Save(OTA_STATE_RESTORING) != HAL_OK)
+        {
+            return HAL_ERROR;
+        }
+    }
+
+    // 3. 将备份镜像写回片内并校验
+    HAL_UART_Transmit(&huart1, (uint8_t *)"OTA restoring\r\n", 15, 1000);
+    OLED_ShowStatus("Restoring...");
+    if (CopyW25Q64ToApp(OTA_BACKUP_ADDR, boot_record.app_size, boot_record.app_crc32) != HAL_OK)
+    {
+        return HAL_ERROR;
+    }
+
+    // 4. 清除试运行标记，同步元数据并恢复 NORMAL 状态
+    if (WriteTrialMark(0) != HAL_OK)
+    {
+        return HAL_ERROR;
+    }
+
+    normal_meta.ota_flag = OTA_FLAG_NORMAL;
+    normal_meta.firmware_size = boot_record.app_size;
+    normal_meta.firmware_crc32 = boot_record.app_crc32;
+    normal_meta.version = boot_record.app_version;
+    if (Bootloader_WriteMeta(&normal_meta) != HAL_OK)
+    {
+        return HAL_ERROR;
+    }
+
+    boot_record.update_size = 0;
+    boot_record.update_crc32 = 0;
+    boot_record.update_version = 0;
+    if (BootRecord_Save(OTA_STATE_NORMAL) != HAL_OK)
+    {
+        return HAL_ERROR;
+    }
+
+    HAL_UART_Transmit(&huart1, (uint8_t *)"OTA rolled back\r\n", 17, 1000);
+    OLED_ShowStatus("Rolled back");
+    return HAL_OK;
+}
+
+// 收到 'C' 后执行：校验新旧镜像 -> 备份当前 App 到 0x4000 -> 提交 INSTALLING
 HAL_StatusTypeDef Bootloader_PrepareInstall(const OTA_MetaInfo_t *meta)
 {
-    if (boot_record.state != OTA_STATE_NORMAL || meta->firmware_size < 8U ||
-        meta->firmware_size > OTA_STAGING_SIZE || meta->firmware_size % 4U != 0U)
-        return HAL_ERROR;
-    OLED_ShowStatus("Checking images");
-    if (!AppMatches(boot_record.app_size, boot_record.app_crc32) ||
-        CheckExternalImage(0, meta->firmware_size, meta->firmware_crc32) != HAL_OK)
-        return HAL_ERROR;
+    uint32_t offset = 0;
 
+    if (boot_record.state != OTA_STATE_NORMAL)
+    {
+        return HAL_ERROR;
+    }
+
+    if (meta->firmware_size < 8U || meta->firmware_size > OTA_STAGING_SIZE || meta->firmware_size % 4U != 0U)
+    {
+        return HAL_ERROR;
+    }
+
+    // 1. 校验片内现行版本与暂存区候选版本
+    OLED_ShowStatus("Checking images");
+    if (!CheckInternalApp(boot_record.app_size, boot_record.app_crc32))
+    {
+        return HAL_ERROR;
+    }
+    if (CheckExternalImage(0, meta->firmware_size, meta->firmware_crc32) != HAL_OK)
+    {
+        return HAL_ERROR;
+    }
+
+    // 2. 备份片内旧版至 W25Q64 0x4000 并读回校验
     OLED_ShowStatus("Backing up App");
-    for (uint32_t offset = 0; offset < boot_record.app_size; offset += 4096U)
+    for (offset = 0; offset < boot_record.app_size; offset += 4096U)
     {
         if (W25Q64_Erase_Sector(OTA_BACKUP_ADDR + offset) != HAL_OK)
+        {
             return HAL_ERROR;
+        }
     }
-    for (uint32_t offset = 0; offset < boot_record.app_size; offset += sizeof(image_page))
-    {
-        uint16_t count = PageLength(boot_record.app_size - offset);
-        if (W25Q64_Write_Page(OTA_BACKUP_ADDR + offset, (uint8_t *)(APP_FLASH_ADDR + offset), count) != HAL_OK)
-            return HAL_ERROR;
-    }
-    if (CheckExternalImage(OTA_BACKUP_ADDR, boot_record.app_size, boot_record.app_crc32) != HAL_OK)
-        return HAL_ERROR;
 
+    for (offset = 0; offset < boot_record.app_size; offset += sizeof(image_page))
+    {
+        uint16_t count = (boot_record.app_size - offset > sizeof(image_page)) ? sizeof(image_page) : (uint16_t)(boot_record.app_size - offset);
+        if (W25Q64_Write_Page(OTA_BACKUP_ADDR + offset, (uint8_t *)(APP_FLASH_ADDR + offset), count) != HAL_OK)
+        {
+            return HAL_ERROR;
+        }
+    }
+
+    if (CheckExternalImage(OTA_BACKUP_ADDR, boot_record.app_size, boot_record.app_crc32) != HAL_OK)
+    {
+        return HAL_ERROR;
+    }
+
+    // 3. 记录待升级镜像信息，切换为 INSTALLING
     boot_record.update_size = meta->firmware_size;
     boot_record.update_crc32 = meta->firmware_crc32;
     boot_record.update_version = meta->version;
     return BootRecord_Save(OTA_STATE_INSTALLING);
 }
 
-static HAL_StatusTypeDef CopyToApp(uint32_t source, uint32_t size, uint32_t crc)
-{
-    if (Bootloader_EraseApp() != HAL_OK)
-        return HAL_ERROR;
-    for (uint32_t offset = 0; offset < size; offset += sizeof(image_page))
-    {
-        uint16_t count = PageLength(size - offset);
-        if (W25Q64_Read_Data(source + offset, image_page, count) != HAL_OK ||
-            Bootloader_WriteFlash(APP_FLASH_ADDR + offset, image_page, count) != HAL_OK)
-            return HAL_ERROR;
-    }
-    return AppMatches(size, crc) ? HAL_OK : HAL_ERROR;
-}
-
-static HAL_StatusTypeDef FinishNormal(void)
-{
-    // 提交确认/回滚结果时，原 16 字节信息也应描述最终运行的 App。
-    // 首次迁移保留旧 App 刚写入的 U 请求，由 main 消费一次。
-    if (active_addr != 0U)
-    {
-        OTA_MetaInfo_t meta = {OTA_FLAG_NORMAL, boot_record.app_size, boot_record.app_crc32, boot_record.app_version};
-        if (Bootloader_WriteMeta(&meta) != HAL_OK)
-            return HAL_ERROR;
-    }
-    boot_record.update_size = 0;
-    boot_record.update_crc32 = 0;
-    boot_record.update_version = 0;
-    return BootRecord_Save(OTA_STATE_NORMAL);
-}
-
-static HAL_StatusTypeDef RestoreApp(void)
-{
-    if (CheckExternalImage(OTA_BACKUP_ADDR, boot_record.app_size, boot_record.app_crc32) != HAL_OK)
-        return HAL_ERROR;
-    if (boot_record.state != OTA_STATE_RESTORING && BootRecord_Save(OTA_STATE_RESTORING) != HAL_OK)
-        return HAL_ERROR;
-    Boot_Message("OTA restoring\r\n");
-    OLED_ShowStatus("Restoring...");
-    if (CopyToApp(OTA_BACKUP_ADDR, boot_record.app_size, boot_record.app_crc32) != HAL_OK ||
-        WriteMark(TRIAL_MARK_ADDR, 0) != HAL_OK || FinishNormal() != HAL_OK)
-        return HAL_ERROR;
-    Boot_Message("OTA rolled back\r\n");
-    OLED_ShowStatus("Rolled back");
-    return HAL_OK;
-}
-
-static HAL_StatusTypeDef LaunchTrial(void)
-{
-    if (!AppMatches(boot_record.update_size, boot_record.update_crc32))
-        return RestoreApp();
-    if (WriteMark(TRIAL_MARK_ADDR, TRIAL_PENDING) != HAL_OK || BootRecord_Save(OTA_STATE_TRIAL_RUNNING) != HAL_OK)
-        return HAL_ERROR;
-
-    Boot_Message("OTA trial\r\n");
-    OLED_ShowStatus("Trial boot");
-    IWDG->KR = 0xCCCCU; // RM0383: 启动、允许配置、装载计数器
-    IWDG->KR = 0x5555U;
-    IWDG->PR = 6U;      // LSI / 256，标称 32 kHz 时约 12 秒
-    IWDG->RLR = 1499U;
-    while (IWDG->SR != 0U) {}
-    IWDG->KR = 0xAAAAU;
-    Bootloader_JumpToApp(APP_FLASH_ADDR);
-    return HAL_ERROR;
-}
-
-static HAL_StatusTypeDef LoadOrMigrate(void)
-{
-    uint8_t migrated;
-    if (BootRecord_Load(&boot_record, &active_addr) != HAL_OK || ReadMark(MIGRATED_ADDR, &migrated) != HAL_OK)
-        return HAL_ERROR;
-    if (active_addr == 0U)
-    {
-        // 首次迁移只接受项目备份内已知的 1.0.3 BIN，不信任上位机提供的候选描述。
-        if (migrated == MIGRATED || !AppMatches(9752U, 0x3F6720C5U))
-        {
-            Boot_Message("OTA baseline unavailable\r\n");
-            return HAL_ERROR;
-        }
-        boot_record.magic = OTA_RECORD_MAGIC;
-        boot_record.app_size = 9752U;
-        boot_record.app_crc32 = 0x3F6720C5U;
-        boot_record.app_version = 0x00010003U;
-        if (WriteMark(TRIAL_MARK_ADDR, 0) != HAL_OK || FinishNormal() != HAL_OK)
-            return HAL_ERROR;
-    }
-    if (migrated != MIGRATED)
-        return WriteMark(MIGRATED_ADDR, MIGRATED);
-    return HAL_OK;
-}
-
-// 在开启 UART 接收前完成恢复，确保升级命令无法覆盖候选或备份。
+// 上电状态机：正常校验 / 断电续装 / 试运行确认或看门狗超时回滚
 HAL_StatusTypeDef Bootloader_Recover(void)
 {
-    uint8_t mark;
-    if ((FLASH->OPTCR & FLASH_OPTCR_WDG_SW) == 0U || LoadOrMigrate() != HAL_OK)
+    uint8_t mark = 0;
+    OTA_MetaInfo_t normal_meta = {0};
+
+    if ((FLASH->OPTCR & FLASH_OPTCR_WDG_SW) == 0U) // 需保持软件看门狗模式
+    {
         return HAL_ERROR;
+    }
+
+    if (BootRecord_Load(&boot_record, &active_addr) != HAL_OK || active_addr == 0U)
+    {
+        return HAL_ERROR;
+    }
+
     switch (boot_record.state)
     {
-        case OTA_STATE_NORMAL:
+        case OTA_STATE_NORMAL: // 常规启动：校验片内 App 后放行
             OLED_ShowStatus("Normal boot");
-            return AppMatches(boot_record.app_size, boot_record.app_crc32) ? HAL_OK : HAL_ERROR;
-        case OTA_STATE_INSTALLING:
-            Boot_Message("OTA installing\r\n");
+            return CheckInternalApp(boot_record.app_size, boot_record.app_crc32) ? HAL_OK : HAL_ERROR;
+
+        case OTA_STATE_INSTALLING: // 搬运新固件并启动试运行（支持断电续装）
+            HAL_UART_Transmit(&huart1, (uint8_t *)"OTA installing\r\n", 16, 1000);
             OLED_ShowStatus("Installing...");
+
             if (CheckExternalImage(OTA_BACKUP_ADDR, boot_record.app_size, boot_record.app_crc32) != HAL_OK)
+            {
                 return HAL_ERROR;
+            }
             if (CheckExternalImage(0, boot_record.update_size, boot_record.update_crc32) != HAL_OK ||
-                CopyToApp(0, boot_record.update_size, boot_record.update_crc32) != HAL_OK)
-                return RestoreApp();
-            if (BootRecord_Save(OTA_STATE_TRIAL_READY) != HAL_OK)
+                CopyW25Q64ToApp(0, boot_record.update_size, boot_record.update_crc32) != HAL_OK)
+            {
+                return RestoreBackupApp();
+            }
+
+            if (WriteTrialMark(TRIAL_PENDING) != HAL_OK)
+            {
                 return HAL_ERROR;
-            return LaunchTrial();
-        case OTA_STATE_TRIAL_READY:
-            return LaunchTrial();
-        case OTA_STATE_TRIAL_RUNNING:
-            if (ReadMark(TRIAL_MARK_ADDR, &mark) != HAL_OK)
+            }
+            if (BootRecord_Save(OTA_STATE_TRIAL_RUNNING) != HAL_OK)
+            {
                 return HAL_ERROR;
-            if (mark != TRIAL_CONFIRMED || !AppMatches(boot_record.update_size, boot_record.update_crc32))
-                return RestoreApp();
+            }
+
+            // 跳转前开启 IWDG (LSI/256, 约 12s 超时)
+            HAL_UART_Transmit(&huart1, (uint8_t *)"OTA trial\r\n", 11, 1000);
+            OLED_ShowStatus("Trial boot");
+            IWDG->KR  = 0xCCCCU;
+            IWDG->KR  = 0x5555U;
+            IWDG->PR  = 6U;
+            IWDG->RLR = 1499U;
+            while (IWDG->SR != 0U) {}
+            IWDG->KR  = 0xAAAAU;
+            Bootloader_JumpToApp(APP_FLASH_ADDR);
+            return HAL_ERROR;
+
+        case OTA_STATE_TRIAL_RUNNING: // 核查 0x90 确认标记：通过则转正，未确认则回滚
+            if (HAL_I2C_Mem_Read(&hi2c2, AT24C02_ADDR, TRIAL_MARK_ADDR, I2C_MEMADD_SIZE_8BIT, &mark, 1, 100) != HAL_OK)
+            {
+                return HAL_ERROR;
+            }
+
+            if (mark != TRIAL_CONFIRMED || !CheckInternalApp(boot_record.update_size, boot_record.update_crc32))
+            {
+                return RestoreBackupApp();
+            }
+
             boot_record.app_size = boot_record.update_size;
             boot_record.app_crc32 = boot_record.update_crc32;
             boot_record.app_version = boot_record.update_version;
-            if (FinishNormal() != HAL_OK)
+            boot_record.update_size = 0;
+            boot_record.update_crc32 = 0;
+            boot_record.update_version = 0;
+
+            normal_meta.ota_flag = OTA_FLAG_NORMAL;
+            normal_meta.firmware_size = boot_record.app_size;
+            normal_meta.firmware_crc32 = boot_record.app_crc32;
+            normal_meta.version = boot_record.app_version;
+            if (Bootloader_WriteMeta(&normal_meta) != HAL_OK)
+            {
                 return HAL_ERROR;
-            Boot_Message("OTA confirmed\r\n");
+            }
+            if (BootRecord_Save(OTA_STATE_NORMAL) != HAL_OK)
+            {
+                return HAL_ERROR;
+            }
+            if (WriteTrialMark(0) != HAL_OK)
+            {
+                return HAL_ERROR;
+            }
+
+            HAL_UART_Transmit(&huart1, (uint8_t *)"OTA confirmed\r\n", 15, 1000);
             OLED_ShowStatus("OTA confirmed");
             return HAL_OK;
-        case OTA_STATE_RESTORING:
-            return RestoreApp();
+
+        case OTA_STATE_RESTORING: // 回滚中途断电后继续恢复
+            return RestoreBackupApp();
+
         default:
             return HAL_ERROR;
     }
 }
+
